@@ -6,22 +6,7 @@ The project reads on-chain data, stores it in PostgreSQL, exposes it through an 
 
 ## Architecture
 
-```text
-Blockchain
-    ↓
-Indexer
-    ↓
-PostgreSQL
-    ↓
-API
-    ↓
-Client
-
-        ↓
-Reconciliation
-        ↓
-Blockchain ↔ Database
-```
+![Basic Architecture](Architecture_Diagrams/Basic_Arch.drawio.png)
 
 ## Main Components
 
@@ -29,21 +14,7 @@ Blockchain ↔ Database
 
 Reads blockchain blocks and relevant contract events.
 
-```text
-RPC
- ↓
-Block Fetcher
- ↓
-Event Filter
- ↓
-Event Decoder
- ↓
-Normalizer
- ↓
-Idempotency Check
- ↓
-PostgreSQL
-```
+![Indexer Architecture](Architecture_Diagrams/Indexer_Arch.drawio.png)
 
 Responsibilities:
 
@@ -81,17 +52,7 @@ PostgreSQL
 
 Acts as a safety check between the database and blockchain.
 
-```text
-Indexed / Expected State
-          ↓
-    Expected Balance
-          ↓
-      Compare
-          ↑
-    Observed Balance
-          ↑
-     Contract Read
-```
+![Reconciliation Architecture](Architecture_Diagrams/Reconciliation_Arch.drawio.png)
 
 If the expected and observed states do not match, the system can detect a possible indexing or data consistency issue.
 
