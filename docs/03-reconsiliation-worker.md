@@ -17,7 +17,7 @@ If they don't match, it creates an exception.
 
 ## 2. Simple Flow
 
-![Reconciliation Architecture](../Arch%20Diagrams/Reconciliation_Arch.drawio.png)
+![Reconciliation Architecture](../Architecture_Diagrams/Reconciliation_Arch.drawio.png)
 
 ## 3. What It Checks
 

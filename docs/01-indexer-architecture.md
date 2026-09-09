@@ -50,7 +50,7 @@ Use a **configurable generic ERC-20 address** for development.
 
 ## 4. Simple Architecture
 
-![Basic Architecture](../Arch%20Diagrams/Indexer_Arch.drawio.png)
+![Basic Architecture](../Architecture_Diagrams/Indexer_Arch.drawio.png)
 
 
 

@@ -49,7 +49,7 @@ produced, safely and consistently.
 
 # 2. Position in the Overall System
 
-![API Architecture](../Arch%20Diagrams/API_Arch.drawio.png)
+![API Architecture](../Architecture_Diagrams/API_Arch.drawio.png)
 
 The API is a **pure consumer** of the Persistence Layer's read
 interface (Section 8 of the Persistence doc). It must not:
@@ -80,7 +80,7 @@ interface (Section 8 of the Persistence doc). It must not:
 
 # 4. High-Level Architecture
 
-![High Level API Architecture](../Arch%20Diagrams/High_Level_API.drawio.png)
+![High Level API Architecture](../Architecture_Diagrams/High_Level_API.drawio.png)
 
 ---
 

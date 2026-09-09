@@ -6,7 +6,7 @@ Persistence is the **storage layer** of the project.
 
 It receives data from the Indexer, stores it safely in PostgreSQL, and provides data for the API and Reconciliation Worker.
 
-![Basic Architecture](../Arch%20Diagrams/Indexer_Arch.drawio.png)
+![Basic Architecture](../Architecture_Diagrams/Indexer_Arch.drawio.png)
 
 ## 2. Main Responsibilities
 
