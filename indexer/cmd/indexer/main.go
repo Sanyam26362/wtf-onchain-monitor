@@ -8,8 +8,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
 
-	"worldtradefuture/indexer/internal/config"
 	"worldtradefuture/indexer/internal/blockchain"
+	"worldtradefuture/indexer/internal/config"
 	"worldtradefuture/indexer/internal/indexer"
 )
 
@@ -24,10 +24,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	contractAddress := common.HexToAddress(cfg.PayrollContractAddress)
-	if contractAddress == (common.Address{}) {
-		log.Fatal("invalid PAYROLL_CONTRACT_ADDRESS")
+	if !common.IsHexAddress(cfg.PayrollContractAddress) {
+		log.Fatalf("invalid PAYROLL_CONTRACT_ADDRESS: %s", cfg.PayrollContractAddress)
 	}
+	contractAddress := common.HexToAddress(cfg.PayrollContractAddress)
 
 	fmt.Println("WTF On-Chain Indexer starting...")
 	fmt.Printf("Chain ID: %d\n", cfg.ChainID)
