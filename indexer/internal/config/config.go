@@ -14,6 +14,7 @@ type Config struct {
 	TokenAddress           string
 	StartBlock             uint64
 	ConfirmationDepth      uint64
+	BlockBatchSize         uint64
 	DatabaseURL            string
 	PollingInterval        time.Duration
 	DeploymentEnvironment   string
@@ -40,6 +41,14 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid POLLING_INTERVAL: %w", err)
 	}
 
+	blockBatchSize := uint64(50)
+	if value := os.Getenv("BLOCK_BATCH_SIZE"); value != "" {
+		blockBatchSize, err = strconv.ParseUint(value, 10, 64)
+		if err != nil || blockBatchSize == 0 {
+			return Config{}, fmt.Errorf("invalid BLOCK_BATCH_SIZE: must be a positive integer")
+		}
+	}
+
 	cfg := Config{
 		ChainID:                chainID,
 		RPCURL:                 getRequired("RPC_URL"),
@@ -47,6 +56,7 @@ func Load() (Config, error) {
 		TokenAddress:           os.Getenv("TOKEN_ADDRESS"),
 		StartBlock:             startBlock,
 		ConfirmationDepth:      confirmationDepth,
+		BlockBatchSize:         blockBatchSize,
 		DatabaseURL:            getRequired("DATABASE_URL"),
 		PollingInterval:        pollingInterval,
 		DeploymentEnvironment:   getRequired("DEPLOYMENT_ENVIRONMENT"),
