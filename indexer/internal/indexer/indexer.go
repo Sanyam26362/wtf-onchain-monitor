@@ -3,10 +3,8 @@ package indexer
 import (
 	"context"
 	"fmt"
-	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 
 	"worldtradefuture/indexer/internal/blockchain"
 	"worldtradefuture/indexer/internal/decoder"
@@ -59,22 +57,16 @@ func (s *Service) IndexRange(ctx context.Context, contractAddress common.Address
 	return events, nil
 }
 
-// NextRange returns the next bounded block range for a configured step size.
-func NextRange(fromBlock, latestBlock, stepSize uint64) (uint64, uint64, bool) {
-	if fromBlock > latestBlock || stepSize == 0 {
+// NextRange returns the next bounded block range for a configured batch size.
+func NextRange(fromBlock, latestBlock, batchSize uint64) (uint64, uint64, bool) {
+	if fromBlock > latestBlock || batchSize == 0 {
 		return 0, 0, false
 	}
 
-	toBlock := new(big.Int).SetUint64(fromBlock)
-	toBlock.Add(toBlock, new(big.Int).SetUint64(stepSize-1))
-	latest := new(big.Int).SetUint64(latestBlock)
-	if toBlock.Cmp(latest) > 0 {
-		toBlock.Set(latest)
+	toBlock := fromBlock + batchSize - 1
+	if toBlock < fromBlock || toBlock > latestBlock {
+		toBlock = latestBlock
 	}
 
-	return fromBlock, toBlock.Uint64(), true
+	return fromBlock, toBlock, true
 }
-
-// Ensure the imported log type remains part of this package's public design when
-// the implementation grows to persistence and receipt processing.
-var _ types.Log
