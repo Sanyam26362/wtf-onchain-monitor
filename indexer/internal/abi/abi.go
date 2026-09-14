@@ -1,6 +1,7 @@
 package abi
 
 import (
+	"errors"
 	"math/big"
 	"strings"
 
@@ -193,11 +194,11 @@ func (m *MainFilterer) UnpackMethodIntoInterface(
 ) error {
 	method, ok := m.abi.Methods[name]
 	if !ok {
-		return abi.ErrMethodNotFound
+		return errors.New("method not found")
 	}
 
 	if len(data) < 4 {
-		return abi.ErrNoMethodID
+		return errors.New("method ID is missing")
 	}
 
 	unpacked, err := method.Inputs.Unpack(data[4:])
