@@ -6,9 +6,9 @@ The service reads payroll and token activity from the blockchain, decodes and no
 
 ---
 
-## Architecture
+---
 
-![Basic Architecture](Architecture_Diagrams/Basic_Arch.drawio.png)
+## Repository Structure
 
 ### Data Flow
 
