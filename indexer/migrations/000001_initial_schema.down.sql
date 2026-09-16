@@ -1,0 +1,8 @@
+-- 000001_initial_schema.down.sql
+DROP TABLE IF EXISTS reconciliation_exceptions CASCADE;
+DROP TABLE IF EXISTS salary_claims CASCADE;
+DROP TABLE IF EXISTS payroll_fundings CASCADE;
+DROP TABLE IF EXISTS chain_events CASCADE;
+DROP TABLE IF EXISTS employees CASCADE;
+DROP TABLE IF EXISTS employers CASCADE;
+DROP TABLE IF EXISTS transactions CASCADE;

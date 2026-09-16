@@ -36,3 +36,14 @@ func (p *Postgres) Close() {
 		p.pool.Close()
 	}
 }
+
+func (p *Postgres) Pool() *pgxpool.Pool {
+	if p == nil {
+		return nil
+	}
+	return p.pool
+}
+
+func (p *Postgres) RunMigrations(ctx context.Context, migrationsDir string) error {
+	return RunMigrations(ctx, p.pool, migrationsDir)
+}
