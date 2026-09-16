@@ -76,3 +76,35 @@ func (p *Postgres) SaveTransaction(
 
 	return nil
 }
+
+// GetExistingTxHashes checks which transaction hashes are already stored in the transactions table.
+func (p *Postgres) GetExistingTxHashes(
+	ctx context.Context,
+	chainID int64,
+	hashes []string,
+) (map[string]bool, error) {
+	result := make(map[string]bool)
+	if len(hashes) == 0 {
+		return result, nil
+	}
+
+	const query = `
+		SELECT tx_hash
+		FROM transactions
+		WHERE chain_id = $1 AND tx_hash = ANY($2)
+	`
+	rows, err := p.pool.Query(ctx, query, chainID, hashes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query existing tx hashes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		result[h] = true
+	}
+	return result, rows.Err()
+}
