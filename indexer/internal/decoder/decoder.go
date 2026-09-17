@@ -13,13 +13,13 @@ import (
 type EventType string
 
 const (
-	EventEmployerAdded         EventType = "EmployerAdded"
-	EventEmployerRemoved       EventType = "EmployerRemoved"
-	EventEmployeeAdded         EventType = "EmployeeAdded"
-	EventEmployeeRemoved       EventType = "EmployeeRemoved"
-	EventPayrollFunded         EventType = "PayrollFunded"
-	EventSalaryClaimed         EventType = "SalaryClaimed"
-	EventOwnershipTransferred  EventType = "OwnershipTransferred"
+	EventEmployerAdded        EventType = "EmployerAdded"
+	EventEmployerRemoved      EventType = "EmployerRemoved"
+	EventEmployeeAdded        EventType = "EmployeeAdded"
+	EventEmployeeRemoved      EventType = "EmployeeRemoved"
+	EventPayrollFunded        EventType = "PayrollFunded"
+	EventSalaryClaimed        EventType = "SalaryClaimed"
+	EventOwnershipTransferred EventType = "OwnershipTransferred"
 )
 
 // DecodedEvent contains the event type, the decoded event data,

@@ -170,3 +170,28 @@ func TestValidateTokenConfig_ValidFromFile(t *testing.T) {
 		t.Fatal("expected ParsedTokenABI to be set after validation")
 	}
 }
+
+func TestLoad_BackfillToBlock(t *testing.T) {
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11080692")
+	t.Setenv("BACKFILL_TO_BLOCK", "11080850")
+	t.Setenv("PAYROLL_STREAM_ID", "custom_payroll")
+	t.Setenv("CONFIRMATION_DEPTH", "5")
+	t.Setenv("POLLING_INTERVAL", "12s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	if cfg.BackfillToBlock == nil || *cfg.BackfillToBlock != 11080850 {
+		t.Fatalf("expected BackfillToBlock to be 11080850, got %v", cfg.BackfillToBlock)
+	}
+
+	if cfg.PayrollStreamID != "custom_payroll" {
+		t.Fatalf("expected PayrollStreamID to be 'custom_payroll', got '%s'", cfg.PayrollStreamID)
+	}
+}

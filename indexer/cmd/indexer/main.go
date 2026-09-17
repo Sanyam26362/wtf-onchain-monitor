@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
-	"time"
+	"os/signal"
+	"syscall"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
@@ -19,8 +22,19 @@ import (
 )
 
 func main() {
+	// Parse command-line flags
+	toBlockFlag := flag.Uint64("to-block", 0, "Target block to backfill to (overrides BACKFILL_TO_BLOCK)")
+	fromBlockFlag := flag.Uint64("from-block", 0, "Override start block for historical backfill")
+	batchSizeFlag := flag.Uint64("batch-size", 0, "Override block batch size")
+	flag.Parse()
+
+	// Initialize structured logger
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	fmt.Println("==================================================")
-	fmt.Println("WTF On-Chain Monitoring & Indexing Service")
+	fmt.Println("WTF On-Chain Monitoring & Historical Backfill")
 	fmt.Println("==================================================")
 
 	if err := godotenv.Load(); err != nil {
@@ -32,12 +46,24 @@ func main() {
 		log.Fatalf("configuration error: %v", err)
 	}
 
+	// Resolve backfill parameters
+	startBlock := cfg.StartBlock
+	if *fromBlockFlag > 0 {
+		startBlock = *fromBlockFlag
+	}
+
+	batchSize := cfg.BlockBatchSize
+	if *batchSizeFlag > 0 {
+		batchSize = *batchSizeFlag
+	}
+
 	fmt.Printf("Chain ID:                %d\n", cfg.ChainID)
 	fmt.Printf("Confirmation Depth:      %d\n", cfg.ConfirmationDepth)
-	fmt.Printf("Block Batch Size:        %d\n", cfg.BlockBatchSize)
+	fmt.Printf("Block Batch Size:        %d\n", batchSize)
 	if cfg.PayrollContractAddress != "" {
 		fmt.Printf("Payroll Contract:        %s\n", cfg.PayrollContractAddress)
-		fmt.Printf("Payroll Start Block:     %d\n", cfg.StartBlock)
+		fmt.Printf("Payroll Start Block:     %d\n", startBlock)
+		fmt.Printf("Payroll Stream ID:       %s\n", cfg.PayrollStreamID)
 	}
 	if cfg.TokenAddress != "" {
 		fmt.Printf("Token Contract:          %s\n", cfg.TokenAddress)
@@ -47,7 +73,7 @@ func main() {
 	}
 	fmt.Println("--------------------------------------------------")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	client, err := blockchain.NewClient(cfg.RPCURL)
@@ -79,23 +105,43 @@ func main() {
 	}
 	fmt.Printf("Latest Sepolia Block:    %d\n", latestBlock)
 
-	// 2. Index MonthlyPayroll if configured
+	// Determine backfill target block
+	var targetBlock uint64
+	if *toBlockFlag > 0 {
+		targetBlock = *toBlockFlag
+	} else if cfg.BackfillToBlock != nil {
+		targetBlock = *cfg.BackfillToBlock
+	} else {
+		targetBlock = latestBlock
+		if cfg.ConfirmationDepth > 0 && latestBlock >= cfg.ConfirmationDepth {
+			targetBlock = latestBlock - cfg.ConfirmationDepth
+		}
+	}
+	fmt.Printf("Backfill Target Block:   %d\n", targetBlock)
+
+	// 2. Historical Backfill: Index MonthlyPayroll if configured
 	if cfg.PayrollContractAddress != "" && common.IsHexAddress(cfg.PayrollContractAddress) {
 		payrollAddr := common.HexToAddress(cfg.PayrollContractAddress)
 		payrollService, err := indexer.New(client, payrollAddr, db)
 		if err != nil {
-			log.Printf("warning: failed to initialize MonthlyPayroll indexer: %v", err)
-		} else {
-			fromBlock, toBlock, ok := indexer.NextRange(cfg.StartBlock, latestBlock, cfg.BlockBatchSize)
-			if ok {
-				fmt.Printf("\n[Stream: monthly_payroll] Indexing block range: %d -> %d\n", fromBlock, toBlock)
-				events, err := payrollService.IndexRange(ctx, cfg.ChainID, payrollAddr, fromBlock, toBlock)
-				if err != nil {
-					log.Fatalf("payroll indexing error: %v", err)
-				}
-				fmt.Printf("[Stream: monthly_payroll] Indexed %d event(s)\n", len(events))
-			}
+			log.Fatalf("failed to initialize MonthlyPayroll indexer: %v", err)
 		}
+
+		opts := indexer.BackfillOptions{
+			ChainID:         cfg.ChainID,
+			ContractAddress: payrollAddr,
+			StartBlock:      startBlock,
+			TargetBlock:     targetBlock,
+			BatchSize:       batchSize,
+			StreamID:        cfg.PayrollStreamID,
+		}
+
+		fmt.Printf("\n[Stream: %s] Starting historical backfill\n", opts.StreamID)
+		lastIndexed, err := payrollService.RunBackfill(ctx, opts)
+		if err != nil {
+			log.Fatalf("payroll indexing error: %v", err)
+		}
+		fmt.Printf("[Stream: %s] Successfully processed up to block %d\n", opts.StreamID, lastIndexed)
 	}
 
 	// 3. Index Generic ERC-20 Token Transfers if configured
@@ -121,7 +167,7 @@ func main() {
 			db,
 			cfg.ChainID,
 			cfg.TokenStartBlock,
-			cfg.BlockBatchSize,
+			batchSize,
 			cfg.ConfirmationDepth,
 			cfg.TokenStreamID,
 		)
@@ -129,18 +175,24 @@ func main() {
 			log.Fatalf("failed to create token indexer: %v", err)
 		}
 
-		fmt.Printf("\n[Stream: %s] Processing generic ERC-20 token: %s\n", cfg.TokenStreamID, cfg.TokenAddress)
-		processed, fromBlock, toBlock, count, err := tokenIndexer.ProcessNextBatch(ctx)
+		tokenTargetBlock := targetBlock
+		if targetBlock < cfg.TokenStartBlock {
+			// If targetBlock was explicitly set lower than token deployment (e.g. for payroll testing), use safeBlock for token
+			var safeBlock uint64 = latestBlock
+			if cfg.ConfirmationDepth > 0 && latestBlock >= cfg.ConfirmationDepth {
+				safeBlock = latestBlock - cfg.ConfirmationDepth
+			}
+			tokenTargetBlock = safeBlock
+		}
+
+		fmt.Printf("\n[Stream: %s] Processing generic ERC-20 token: %s (target block: %d)\n", cfg.TokenStreamID, cfg.TokenAddress, tokenTargetBlock)
+		lastIndexedToken, totalTransfers, err := tokenIndexer.RunBackfill(ctx, tokenTargetBlock)
 		if err != nil {
 			log.Fatalf("token indexing error: %v", err)
 		}
 
-		if processed {
-			fmt.Printf("[Stream: %s] Successfully indexed %d Transfer(s) in block range %d -> %d\n",
-				cfg.TokenStreamID, count, fromBlock, toBlock)
-		} else {
-			fmt.Printf("[Stream: %s] No new blocks to index (up to block %d)\n", cfg.TokenStreamID, toBlock)
-		}
+		fmt.Printf("[Stream: %s] Successfully indexed %d Transfer(s) up to block %d\n",
+			cfg.TokenStreamID, totalTransfers, lastIndexedToken)
 	}
 
 	fmt.Println("==================================================")

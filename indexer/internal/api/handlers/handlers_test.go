@@ -334,11 +334,11 @@ func TestDatabaseIntegrationHandlers(t *testing.T) {
 	defer pg.Close()
 
 	cfg := &config.Config{
-		ChainID:            11155111,
-		TokenAddress:       "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
-		ConfirmationDepth:  64,
+		ChainID:               11155111,
+		TokenAddress:          "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+		ConfirmationDepth:     64,
 		DeploymentEnvironment: "test",
-		RPCURL:             "https://rpc.example.com",
+		RPCURL:                "https://rpc.example.com",
 	}
 
 	// 1. Ready Handler

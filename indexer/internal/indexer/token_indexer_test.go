@@ -20,13 +20,13 @@ import (
 )
 
 type mockBlockchainClient struct {
-	latestBlock       uint64
-	logs              []types.Log
-	failGetTokenLogs  bool
-	failLatestBlock   bool
-	failBlockTime     bool
-	blockTimestamp    uint64
-	txMetadata        *blockchain.TransactionMetadata
+	latestBlock      uint64
+	logs             []types.Log
+	failGetTokenLogs bool
+	failLatestBlock  bool
+	failBlockTime    bool
+	blockTimestamp   uint64
+	txMetadata       *blockchain.TransactionMetadata
 }
 
 func (m *mockBlockchainClient) LatestBlock(ctx context.Context) (uint64, error) {

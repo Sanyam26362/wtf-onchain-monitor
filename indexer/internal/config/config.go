@@ -1,5 +1,3 @@
-
-
 package config
 
 import (
@@ -25,6 +23,8 @@ type Config struct {
 	TokenStartBlock        uint64
 	TokenStreamID          string
 	StartBlock             uint64
+	BackfillToBlock        *uint64
+	PayrollStreamID        string
 	ConfirmationDepth      uint64
 	BlockBatchSize         uint64
 	DatabaseURL            string
@@ -92,6 +92,20 @@ func Load() (Config, error) {
 
 	payrollContract := os.Getenv("PAYROLL_CONTRACT_ADDRESS")
 
+	var backfillToBlock *uint64
+	if val := os.Getenv("BACKFILL_TO_BLOCK"); val != "" {
+		parsed, parseErr := strconv.ParseUint(val, 10, 64)
+		if parseErr != nil {
+			return Config{}, fmt.Errorf("invalid BACKFILL_TO_BLOCK: %w", parseErr)
+		}
+		backfillToBlock = &parsed
+	}
+
+	payrollStreamID := os.Getenv("PAYROLL_STREAM_ID")
+	if payrollStreamID == "" {
+		payrollStreamID = "monthly_payroll"
+	}
+
 	tokenAddress := os.Getenv("TOKEN_ADDRESS")
 	tokenABIPath := os.Getenv("TOKEN_ABI_PATH")
 	tokenABIJSON := os.Getenv("TOKEN_ABI_JSON")
@@ -106,7 +120,7 @@ func Load() (Config, error) {
 	}
 
 	tokenStreamID := os.Getenv("TOKEN_STREAM_ID")
-	if tokenStreamID == "" && tokenAddress != "" {
+	if (tokenStreamID == "" || tokenStreamID == "erc20_transfers") && tokenAddress != "" {
 		tokenStreamID = fmt.Sprintf("erc20_transfers_%s", strings.ToLower(tokenAddress))
 	} else if tokenStreamID == "" {
 		tokenStreamID = "erc20_transfers"
@@ -142,6 +156,8 @@ func Load() (Config, error) {
 		TokenStartBlock:        tokenStartBlock,
 		TokenStreamID:          tokenStreamID,
 		StartBlock:             startBlock,
+		BackfillToBlock:        backfillToBlock,
+		PayrollStreamID:        payrollStreamID,
 		ConfirmationDepth:      confirmationDepth,
 		BlockBatchSize:         blockBatchSize,
 		DatabaseURL:            dbURL,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -50,8 +51,8 @@ func NewTokenIndexer(
 	if batchSize == 0 {
 		batchSize = 50
 	}
-	if streamID == "" {
-		streamID = fmt.Sprintf("erc20_transfers_%s", eventDecoder.TokenAddress().Hex())
+	if streamID == "" || streamID == "erc20_transfers" {
+		streamID = fmt.Sprintf("erc20_transfers_%s", strings.ToLower(eventDecoder.TokenAddress().Hex()))
 	}
 
 	return &TokenIndexer{
@@ -85,12 +86,21 @@ func (ti *TokenIndexer) GetEffectiveStartBlock(ctx context.Context) (uint64, err
 	}
 
 	if found {
+		resumeBlock := lastBlock + 1
+		if resumeBlock < ti.startBlock {
+			slog.Warn("checkpoint block is before configured token start block, starting from configured block",
+				"stream_id", ti.streamID,
+				"checkpoint_block", lastBlock,
+				"start_block", ti.startBlock,
+			)
+			resumeBlock = ti.startBlock
+		}
 		slog.Info("resuming token indexer from durable checkpoint",
 			"stream_id", ti.streamID,
 			"checkpoint_block", lastBlock,
-			"resume_block", lastBlock+1,
+			"resume_block", resumeBlock,
 		)
-		return lastBlock + 1, nil
+		return resumeBlock, nil
 	}
 
 	slog.Info("no existing checkpoint found, starting from configured block",
@@ -318,4 +328,84 @@ func (ti *TokenIndexer) ProcessNextBatch(ctx context.Context) (bool, uint64, uin
 	}
 
 	return true, fromBlock, toBlock, len(transfers), nil
+}
+
+// RunBackfill indexes bounded chunks from GetEffectiveStartBlock up to targetBlock.
+// If targetBlock is 0, it computes and uses the latest safe block.
+func (ti *TokenIndexer) RunBackfill(ctx context.Context, targetBlock uint64) (uint64, int, error) {
+	fromBlock, err := ti.GetEffectiveStartBlock(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	latestBlock, err := ti.client.LatestBlock(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to fetch latest block: %w", err)
+	}
+
+	var safeBlock uint64 = latestBlock
+	if ti.confirmationDepth > 0 && latestBlock >= ti.confirmationDepth {
+		safeBlock = latestBlock - ti.confirmationDepth
+	}
+
+	effectiveTarget := safeBlock
+	if targetBlock > 0 && targetBlock <= safeBlock {
+		effectiveTarget = targetBlock
+	}
+
+	if fromBlock > effectiveTarget {
+		slog.Info("token indexer up to date, no new blocks to index",
+			"stream_id", ti.streamID,
+			"from_block", fromBlock,
+			"target_block", effectiveTarget,
+		)
+		return effectiveTarget, 0, nil
+	}
+
+	slog.Info("Starting token historical backfill",
+		"token", ti.tokenAddress.Hex(),
+		"stream_id", ti.streamID,
+		"from_block", fromBlock,
+		"target_block", effectiveTarget,
+		"batch_size", ti.batchSize,
+	)
+
+	totalTransfers := 0
+	lastIndexedBlock := fromBlock - 1
+
+	for from := fromBlock; from <= effectiveTarget; {
+		to := from + ti.batchSize - 1
+		if to > effectiveTarget {
+			to = effectiveTarget
+		}
+
+		slog.Info("Processing token block range",
+			"stream_id", ti.streamID,
+			"from", from,
+			"to", to,
+		)
+
+		transfers, err := ti.IndexRange(ctx, from, to)
+		if err != nil {
+			slog.Error("Failed to index token block range",
+				"stream_id", ti.streamID,
+				"from", from,
+				"to", to,
+				"error", err,
+			)
+			return lastIndexedBlock, totalTransfers, fmt.Errorf("token index range [%d, %d]: %w", from, to, err)
+		}
+
+		totalTransfers += len(transfers)
+		lastIndexedBlock = to
+		from = to + 1
+	}
+
+	slog.Info("Token historical backfill completed",
+		"stream_id", ti.streamID,
+		"last_indexed_block", lastIndexedBlock,
+		"total_transfers", totalTransfers,
+	)
+
+	return lastIndexedBlock, totalTransfers, nil
 }

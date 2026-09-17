@@ -157,35 +157,28 @@ Configuration is loaded from environment variables (or local `indexer/.env`). Se
 
 ---
 
-## Generic ERC-20 Token Indexing
+## WTF ERC-20 Token Indexing
 
-The ERC-20 indexer is designed to be **completely token-agnostic**. It contains no hardcoded token addresses, decimals, names, or token-specific business logic.
+The ERC-20 indexer is designed to be **token-agnostic** while providing isolated checkpointing and robust start-block safety for the **WorldTradeFuture (WTF) Token** on Sepolia.
 
-### Conceptual Configuration
+### WTF Token Deployment Configuration
 ```env
-TOKEN_ADDRESS=<token contract address>
-TOKEN_ABI_PATH=<ERC-20 ABI path>
-TOKEN_START_BLOCK=<initial block number>
-TOKEN_STREAM_ID=<stream identifier>
+# WorldTradeFuture (WTF) ERC-20 Token on Ethereum Sepolia
+TOKEN_ADDRESS=0x378AFb93CaDd39AFF154704d2D90Af8c401137E7
+TOKEN_ABI_PATH=./abi/erc20.json
+TOKEN_START_BLOCK=11717931
+TOKEN_STREAM_ID=erc20_transfers_0x378AFb93CaDd39AFF154704d2D90Af8c401137E7
 ```
 
 ### How it Works
-1. When `TOKEN_ADDRESS` and `TOKEN_ABI_PATH` are supplied in `.env`, the indexer parses the ABI and validates that it contains a standard ERC-20 `Transfer(address indexed from, address indexed to, uint256 value)` event specification.
-2. The indexer queries log events matching the contract address, decodes them via `GenericERC20Filterer`, and persists them into the `token_transfers` table.
-3. Progress is recorded in `sync_checkpoints` using the stream ID specified by `TOKEN_STREAM_ID`.
+1. **ABI Validation**: When `TOKEN_ADDRESS` and `TOKEN_ABI_PATH` are supplied in `.env`, the indexer parses the ABI and validates that it contains a standard ERC-20 `Transfer(address indexed from, address indexed to, uint256 value)` event specification.
+2. **Log Ingestion & Decoding**: The indexer queries log events matching the token contract address in bounded chunks (`BLOCK_BATCH_SIZE`), decodes them via `GenericERC20Filterer`, and persists them idempotently into the `token_transfers` and `chain_events` tables.
+3. **Checkpoint Stream Isolation**: Progress is tracked in `sync_checkpoints` under an address-specific stream ID (e.g., `erc20_transfers_0x378AFb93CaDd39AFF154704d2D90Af8c401137E7`). If `TOKEN_STREAM_ID` is unset or left as the generic `"erc20_transfers"`, the indexer automatically appends the token contract address to guarantee isolation between different token contracts and prevent collisions with past test tokens.
+4. **Start Block Clamping**: If a database checkpoint records a block lower than `TOKEN_START_BLOCK` (e.g., from an earlier test token or initial setup), the indexer safely clamps the effective start block to `max(checkpoint + 1, TOKEN_START_BLOCK)`. This prevents the indexer from querying millions of blocks prior to contract creation.
+5. **Independent Payroll Coexistence**: The MonthlyPayroll indexer (`0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC`, start block `11080692`, stream `monthly_payroll`) runs completely independently without interference from token indexing.
 
-### Switching Tokens
-Switching from the current test ERC-20 token to the actual WTF ERC-20 token upon deployment requires **only configuration changes** in `.env`:
-
-```env
-# Example: Switching to a newly deployed WTF Token
-TOKEN_ADDRESS=0xYourNewTokenContractAddress
-TOKEN_ABI_PATH=./abi/wtf-token.json
-TOKEN_START_BLOCK=11750000
-TOKEN_STREAM_ID=erc20_transfers_wtf
-```
-
-> **Important:** The currently configured token is a test token on Sepolia (e.g. Sepolia USDC / LINK) used for integration and verification. Switching to the eventual production WTF token requires zero Go source code changes, provided the contract adheres to the standard ERC-20 `Transfer` event interface.
+### Switching or Adding Tokens
+Switching to another token requires only changing configuration in `.env`. Existing checkpoints for previously indexed tokens remain preserved in PostgreSQL for auditing.
 
 ---
 
@@ -207,12 +200,39 @@ Database migrations in `indexer/migrations/` apply automatically when the API or
 - `000002_token_transfers_and_checkpoints`: `sync_checkpoints` and `token_transfers` tables
 - `000003_api_indexes`: Composite indexes optimizing high-volume API queries
 
-### 2. Running the Indexer
-To run an indexing cycle from the command line:
+### 2. Running the Historical Blockchain Backfill
+
+The indexer runs in a bounded, chunked historical backfill mode to ingest past events from `START_BLOCK` up to a configurable target block.
+
+#### Configuration Options
+Set parameters in `.env` or pass as environment variables:
+```env
+START_BLOCK=11080692
+BACKFILL_TO_BLOCK=11080850
+BLOCK_BATCH_SIZE=50
+```
+
+#### Running the Backfill
+Execute from the `indexer` directory:
 ```bash
 cd indexer
+
+# Option A: Using CLI flags (overrides environment variables)
+go run ./cmd/indexer --to-block 11080850 --batch-size 50
+
+# Option B: Using environment variables
+START_BLOCK=11080692 BACKFILL_TO_BLOCK=11080850 BLOCK_BATCH_SIZE=50 go run ./cmd/indexer
+
+# Option C: Relying on .env defaults (defaults target block to safe block: latestBlock - confirmationDepth)
 go run ./cmd/indexer
 ```
+
+#### How the Historical Backfill Works
+- **Bounded Chunking**: The historical range is split into discrete chunks of `BLOCK_BATCH_SIZE` (default: 50 blocks, e.g., `11080692 -> 11080741`, `11080742 -> 11080791`). A partial final range is computed automatically to end precisely at the target block. No massive single RPC requests are made.
+- **Durable Checkpointing**: Progress is atomically recorded in `sync_checkpoints` for the `monthly_payroll` stream after each successful batch. If interrupted, restarting resumes from `last_indexed_block + 1`.
+- **Idempotency Guarantee**: All persistence calls use `ON CONFLICT DO UPDATE` or `ON CONFLICT DO NOTHING` against unique constraints `(chain_id, contract_address, tx_hash, log_index)`. Replaying blocks does not duplicate records.
+- **Domain Projections**: When `EmployeeAdded` events are detected, the indexer automatically satisfies the employer foreign key and inserts/updates the `employees` table. `EmployeeRemoved` updates the employee's active status to `false`. Funding and claim events are projected into `payroll_fundings` and `salary_claims`.
+
 
 ### 3. Running the REST API Server
 To start the REST API service:
@@ -420,7 +440,7 @@ curl -s http://localhost:8080/ready
     "chain_id": 11155111,
     "database": "connected",
     "environment": "development",
-    "generic_token_contract": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "generic_token_contract": "0x378AFb93CaDd39AFF154704d2D90Af8c401137E7",
     "payroll_contract": "0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC",
     "status": "ready"
   }
@@ -435,13 +455,20 @@ curl -s http://localhost:8080/v1/sync/status
 {
   "data": {
     "chain_id": 11155111,
-    "latest_block": 11714490,
-    "safe_block": 11714485,
+    "latest_block": 11724718,
+    "safe_block": 11724713,
     "streams": [
       {
-        "stream_id": "erc20_transfers",
-        "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
-        "last_indexed_block": 11714490,
+        "stream_id": "monthly_payroll",
+        "contract": "0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC",
+        "last_indexed_block": 11080850,
+        "lag": 643863,
+        "status": "backfilling"
+      },
+      {
+        "stream_id": "erc20_transfers_0x378AFb93CaDd39AFF154704d2D90Af8c401137E7",
+        "token": "0x378AFb93CaDd39AFF154704d2D90Af8c401137E7",
+        "last_indexed_block": 11724713,
         "lag": 0,
         "status": "synced"
       }
@@ -451,46 +478,46 @@ curl -s http://localhost:8080/v1/sync/status
 }
 ```
 
-#### 4. Generic ERC-20 Token Transfers
+#### 4. WTF ERC-20 Token Transfers
 ```bash
-curl -s "http://localhost:8080/v1/tokens/0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238/transfers?page=1&page_size=2"
+curl -s "http://localhost:8080/v1/tokens/0x378AFb93CaDd39AFF154704d2D90Af8c401137E7/transfers?page=1&page_size=10"
 ```
 ```json
 {
   "data": [
     {
-      "id": 87,
+      "id": 354,
       "chain_id": 11155111,
-      "token": "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238",
-      "from_address": "0xb0cc453467799b25df1090a540d14678364ea313",
-      "to_address": "0xd8a0a56d9b21a65d5e44a3d8af3f0cac8284f3ba",
-      "amount": 1,
-      "tx_hash": "0xf73f051814e18d7073ad9db5d6a28cb66f0946f1ba403edca0207d16bb2cbdbf",
-      "block_number": 11714490,
-      "block_timestamp":"2026-09-16T04:33:48Z",
-      "log_index": 250,
+      "token": "0x378afb93cadd39aff154704d2d90af8c401137e7",
+      "from_address": "0x0000000000000000000000000000000000000000",
+      "to_address": "0x5d1beadf6e5f9a1ea564162c797344b1337482de",
+      "amount": 1000000000000000000000000000,
+      "tx_hash": "0x1e4051e25e97b8250aff9dfe346b49e743d09c7fcc1876294b3f2e5948f7a3f1",
+      "block_number": 11717931,
+      "block_timestamp": "2026-09-16T16:34:36Z",
+      "log_index": 123,
       "removed": false,
-      "created_at": "2026-09-16T05:10:46.726229Z"
+      "created_at": "2026-09-17T15:52:46.494398Z"
     }
   ],
   "meta": {
     "page": 1,
-    "page_size": 2,
-    "total": 59,
-    "has_next": true
+    "page_size": 10,
+    "total": 1,
+    "has_next": false
   },
   "pagination": {
     "page": 1,
-    "page_size": 2,
-    "total": 59,
-    "has_next": true
+    "page_size": 10,
+    "total": 1,
+    "has_next": false
   }
 }
 ```
 
-#### 5. Directional Wallet Filter (`direction=out`)
+#### 5. Directional Wallet Filter (`direction=out` or `direction=in`)
 ```bash
-curl -s "http://localhost:8080/v1/tokens/0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238/transfers?wallet=0xb0cc453467799b25df1090a540d14678364ea313&direction=out&page=1&page_size=1"
+curl -s "http://localhost:8080/v1/tokens/0x378AFb93CaDd39AFF154704d2D90Af8c401137E7/transfers?wallet=0x5d1beadf6e5f9a1ea564162c797344b1337482de&direction=in&page=1&page_size=10"
 ```
 
 #### 6. Transaction Details with Decoded Events
