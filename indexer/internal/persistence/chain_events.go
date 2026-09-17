@@ -49,7 +49,9 @@ func (p *Postgres) SaveChainEvent(
 			tx_hash,
 			log_index
 		)
-		DO NOTHING
+		DO UPDATE SET
+			removed = EXCLUDED.removed,
+			block_timestamp = EXCLUDED.block_timestamp
 	`
 
 	blockTime := time.Unix(int64(blockTimestamp), 0).UTC()

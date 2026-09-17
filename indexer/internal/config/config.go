@@ -29,6 +29,8 @@ type Config struct {
 	BlockBatchSize         uint64
 	DatabaseURL            string
 	PollingInterval        time.Duration
+	LiveMonitorEnabled     bool
+	LivePollInterval       time.Duration
 	DeploymentEnvironment  string
 
 	// API Configuration
@@ -53,23 +55,50 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	confirmationDepth, err := getUint64("CONFIRMATION_DEPTH")
+	confirmationDepthStr := os.Getenv("CONFIRMATIONS")
+	if confirmationDepthStr == "" {
+		confirmationDepthStr = os.Getenv("CONFIRMATION_DEPTH")
+	}
+	if confirmationDepthStr == "" {
+		return Config{}, fmt.Errorf("missing required environment variable: CONFIRMATION_DEPTH or CONFIRMATIONS")
+	}
+	confirmationDepth, err := strconv.ParseUint(confirmationDepthStr, 10, 64)
 	if err != nil {
-		return Config{}, err
+		return Config{}, fmt.Errorf("invalid CONFIRMATIONS / CONFIRMATION_DEPTH: %w", err)
 	}
 
-	pollingIntervalStr, err := getRequired("POLLING_INTERVAL")
-	if err != nil {
-		return Config{}, err
+	pollingIntervalStr := os.Getenv("LIVE_POLL_INTERVAL")
+	if pollingIntervalStr == "" {
+		pollingIntervalStr = os.Getenv("POLLING_INTERVAL")
+	}
+	if pollingIntervalStr == "" {
+		return Config{}, fmt.Errorf("missing required environment variable: POLLING_INTERVAL or LIVE_POLL_INTERVAL")
 	}
 	pollingInterval, err := time.ParseDuration(pollingIntervalStr)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid POLLING_INTERVAL: %w", err)
 	}
 
+	livePollInterval := pollingInterval
+	if val := os.Getenv("LIVE_POLL_INTERVAL"); val != "" {
+		parsed, parseErr := time.ParseDuration(val)
+		if parseErr == nil && parsed > 0 {
+			livePollInterval = parsed
+		}
+	}
+
+	liveMonitorEnabled := false
+	if val := os.Getenv("LIVE_MONITOR_ENABLED"); val != "" {
+		liveMonitorEnabled = strings.EqualFold(val, "true") || val == "1"
+	}
+
 	blockBatchSize := uint64(50)
-	if value := os.Getenv("BLOCK_BATCH_SIZE"); value != "" {
-		blockBatchSize, err = strconv.ParseUint(value, 10, 64)
+	batchVal := os.Getenv("INDEXER_BATCH_SIZE")
+	if batchVal == "" {
+		batchVal = os.Getenv("BLOCK_BATCH_SIZE")
+	}
+	if batchVal != "" {
+		blockBatchSize, err = strconv.ParseUint(batchVal, 10, 64)
 		if err != nil || blockBatchSize == 0 {
 			return Config{}, fmt.Errorf("invalid BLOCK_BATCH_SIZE: must be a positive integer")
 		}
@@ -162,6 +191,8 @@ func Load() (Config, error) {
 		BlockBatchSize:         blockBatchSize,
 		DatabaseURL:            dbURL,
 		PollingInterval:        pollingInterval,
+		LiveMonitorEnabled:     liveMonitorEnabled,
+		LivePollInterval:       livePollInterval,
 		DeploymentEnvironment:  env,
 		APIHost:                apiHost,
 		APIPort:                apiPort,

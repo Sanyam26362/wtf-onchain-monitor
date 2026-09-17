@@ -195,3 +195,33 @@ func TestLoad_BackfillToBlock(t *testing.T) {
 		t.Fatalf("expected PayrollStreamID to be 'custom_payroll', got '%s'", cfg.PayrollStreamID)
 	}
 }
+
+func TestLoad_LiveMonitoringConfig(t *testing.T) {
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11080692")
+	t.Setenv("CONFIRMATIONS", "10")
+	t.Setenv("INDEXER_BATCH_SIZE", "25")
+	t.Setenv("LIVE_MONITOR_ENABLED", "true")
+	t.Setenv("LIVE_POLL_INTERVAL", "3s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	if cfg.ConfirmationDepth != 10 {
+		t.Errorf("expected ConfirmationDepth 10, got %d", cfg.ConfirmationDepth)
+	}
+	if cfg.BlockBatchSize != 25 {
+		t.Errorf("expected BlockBatchSize 25, got %d", cfg.BlockBatchSize)
+	}
+	if !cfg.LiveMonitorEnabled {
+		t.Errorf("expected LiveMonitorEnabled to be true")
+	}
+	if cfg.LivePollInterval.Seconds() != 3 {
+		t.Errorf("expected LivePollInterval 3s, got %v", cfg.LivePollInterval)
+	}
+}

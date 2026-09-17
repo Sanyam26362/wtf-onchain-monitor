@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -26,6 +27,10 @@ func main() {
 	toBlockFlag := flag.Uint64("to-block", 0, "Target block to backfill to (overrides BACKFILL_TO_BLOCK)")
 	fromBlockFlag := flag.Uint64("from-block", 0, "Override start block for historical backfill")
 	batchSizeFlag := flag.Uint64("batch-size", 0, "Override block batch size")
+	liveFlag := flag.Bool("live", false, "Run in continuous live monitoring mode")
+	pollIntervalFlag := flag.Duration("poll-interval", 0, "Override live polling interval (e.g. 5s)")
+	confirmationsFlag := flag.Uint64("confirmations", 0, "Override confirmation depth")
+	streamFlag := flag.String("stream", "all", "Stream to process ('payroll', 'token', or 'all')")
 	flag.Parse()
 
 	// Initialize structured logger
@@ -57,9 +62,25 @@ func main() {
 		batchSize = *batchSizeFlag
 	}
 
+	if *confirmationsFlag > 0 {
+		cfg.ConfirmationDepth = *confirmationsFlag
+	}
+
+	if *pollIntervalFlag > 0 {
+		cfg.LivePollInterval = *pollIntervalFlag
+	}
+
+	isLiveMode := *liveFlag || cfg.LiveMonitorEnabled
+
 	fmt.Printf("Chain ID:                %d\n", cfg.ChainID)
 	fmt.Printf("Confirmation Depth:      %d\n", cfg.ConfirmationDepth)
 	fmt.Printf("Block Batch Size:        %d\n", batchSize)
+	if isLiveMode {
+		fmt.Printf("Mode:                    LIVE MONITORING\n")
+		fmt.Printf("Polling Interval:        %s\n", cfg.LivePollInterval)
+	} else {
+		fmt.Printf("Mode:                    HISTORICAL BACKFILL\n")
+	}
 	if cfg.PayrollContractAddress != "" {
 		fmt.Printf("Payroll Contract:        %s\n", cfg.PayrollContractAddress)
 		fmt.Printf("Payroll Start Block:     %d\n", startBlock)
@@ -105,6 +126,84 @@ func main() {
 	}
 	fmt.Printf("Latest Sepolia Block:    %d\n", latestBlock)
 
+	// Initialize MonthlyPayroll indexer service if configured
+	var payrollService *indexer.Service
+	if cfg.PayrollContractAddress != "" && common.IsHexAddress(cfg.PayrollContractAddress) && (*streamFlag == "all" || *streamFlag == "payroll") {
+		payrollAddr := common.HexToAddress(cfg.PayrollContractAddress)
+		var err error
+		payrollService, err = indexer.New(client, payrollAddr, db)
+		if err != nil {
+			log.Fatalf("failed to initialize MonthlyPayroll indexer: %v", err)
+		}
+	}
+
+	// Initialize Generic ERC-20 Token indexer if configured
+	var tokenIndexer *indexer.TokenIndexer
+	if cfg.TokenAddress != "" && (*streamFlag == "all" || *streamFlag == "token") {
+		if err := cfg.ValidateTokenConfig(); err != nil {
+			log.Fatalf("token configuration invalid: %v", err)
+		}
+
+		tokenAddr := common.HexToAddress(cfg.TokenAddress)
+		tokenFilterer, err := indexerABI.NewGenericERC20Filterer(tokenAddr, cfg.ParsedTokenABI)
+		if err != nil {
+			log.Fatalf("failed to create generic ERC-20 filterer: %v", err)
+		}
+
+		tokenDecoder, err := decoder.NewERC20Decoder(tokenFilterer)
+		if err != nil {
+			log.Fatalf("failed to create ERC-20 decoder: %v", err)
+		}
+
+		tokenIndexer, err = indexer.NewTokenIndexer(
+			client,
+			tokenDecoder,
+			db,
+			cfg.ChainID,
+			cfg.TokenStartBlock,
+			batchSize,
+			cfg.ConfirmationDepth,
+			cfg.TokenStreamID,
+		)
+		if err != nil {
+			log.Fatalf("failed to create token indexer: %v", err)
+		}
+	}
+
+	// Branch: Continuous Live Monitoring vs Historical Backfill
+	if isLiveMode {
+		fmt.Println("\n==================================================")
+		fmt.Println("Starting continuous live monitoring...")
+		fmt.Println("==================================================")
+
+		liveCfg := indexer.LiveMonitorConfig{
+			ChainID:                cfg.ChainID,
+			ConfirmationDepth:      cfg.ConfirmationDepth,
+			BatchSize:              batchSize,
+			PollInterval:           cfg.LivePollInterval,
+			PayrollContractAddress: common.HexToAddress(cfg.PayrollContractAddress),
+			PayrollStreamID:        cfg.PayrollStreamID,
+			PayrollStartBlock:      startBlock,
+			TokenAddress:           common.HexToAddress(cfg.TokenAddress),
+			TokenStreamID:          cfg.TokenStreamID,
+			TokenStartBlock:        cfg.TokenStartBlock,
+		}
+
+		liveMonitor, err := indexer.NewLiveMonitor(liveCfg, client, payrollService, tokenIndexer, db)
+		if err != nil {
+			log.Fatalf("failed to initialize live monitor: %v", err)
+		}
+
+		if err := liveMonitor.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("live monitor error: %v", err)
+		}
+
+		fmt.Println("==================================================")
+		fmt.Println("WTF Live Monitor shut down cleanly.")
+		fmt.Println("==================================================")
+		return
+	}
+
 	// Determine backfill target block
 	var targetBlock uint64
 	if *toBlockFlag > 0 {
@@ -120,13 +219,8 @@ func main() {
 	fmt.Printf("Backfill Target Block:   %d\n", targetBlock)
 
 	// 2. Historical Backfill: Index MonthlyPayroll if configured
-	if cfg.PayrollContractAddress != "" && common.IsHexAddress(cfg.PayrollContractAddress) {
+	if payrollService != nil {
 		payrollAddr := common.HexToAddress(cfg.PayrollContractAddress)
-		payrollService, err := indexer.New(client, payrollAddr, db)
-		if err != nil {
-			log.Fatalf("failed to initialize MonthlyPayroll indexer: %v", err)
-		}
-
 		opts := indexer.BackfillOptions{
 			ChainID:         cfg.ChainID,
 			ContractAddress: payrollAddr,
@@ -145,36 +239,7 @@ func main() {
 	}
 
 	// 3. Index Generic ERC-20 Token Transfers if configured
-	if cfg.TokenAddress != "" {
-		if err := cfg.ValidateTokenConfig(); err != nil {
-			log.Fatalf("token configuration invalid: %v", err)
-		}
-
-		tokenAddr := common.HexToAddress(cfg.TokenAddress)
-		tokenFilterer, err := indexerABI.NewGenericERC20Filterer(tokenAddr, cfg.ParsedTokenABI)
-		if err != nil {
-			log.Fatalf("failed to create generic ERC-20 filterer: %v", err)
-		}
-
-		tokenDecoder, err := decoder.NewERC20Decoder(tokenFilterer)
-		if err != nil {
-			log.Fatalf("failed to create ERC-20 decoder: %v", err)
-		}
-
-		tokenIndexer, err := indexer.NewTokenIndexer(
-			client,
-			tokenDecoder,
-			db,
-			cfg.ChainID,
-			cfg.TokenStartBlock,
-			batchSize,
-			cfg.ConfirmationDepth,
-			cfg.TokenStreamID,
-		)
-		if err != nil {
-			log.Fatalf("failed to create token indexer: %v", err)
-		}
-
+	if tokenIndexer != nil {
 		tokenTargetBlock := targetBlock
 		if targetBlock < cfg.TokenStartBlock {
 			// If targetBlock was explicitly set lower than token deployment (e.g. for payroll testing), use safeBlock for token

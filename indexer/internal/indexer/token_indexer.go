@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -144,7 +145,38 @@ func (ti *TokenIndexer) IndexRange(
 		return nil, err
 	}
 
-	slog.Info("fetched Transfer logs from blockchain",
+	if ti.decoder.HasApproval() {
+		apprTopic, ok := ti.decoder.ApprovalTopic()
+		if ok {
+			apprLogs, err := ti.client.GetTokenLogs(
+				ctx,
+				ti.tokenAddress,
+				apprTopic,
+				fromBlock,
+				toBlock,
+			)
+			if err != nil {
+				slog.Error("failed to fetch token approval logs from RPC",
+					"token", ti.tokenAddress.Hex(),
+					"from_block", fromBlock,
+					"to_block", toBlock,
+					"error", err,
+				)
+				return nil, err
+			}
+			if len(apprLogs) > 0 {
+				logs = append(logs, apprLogs...)
+				sort.SliceStable(logs, func(i, j int) bool {
+					if logs[i].BlockNumber == logs[j].BlockNumber {
+						return logs[i].Index < logs[j].Index
+					}
+					return logs[i].BlockNumber < logs[j].BlockNumber
+				})
+			}
+		}
+	}
+
+	slog.Info("fetched logs from blockchain",
 		"token", ti.tokenAddress.Hex(),
 		"from_block", fromBlock,
 		"to_block", toBlock,
@@ -163,35 +195,63 @@ func (ti *TokenIndexer) IndexRange(
 		}
 	}
 
-	// 2. Decode transfers and collect unique transaction hashes
+	// 2. Decode transfers and approvals, and collect unique transaction hashes
 	transfers := make([]*models.TokenTransfer, 0, len(logs))
 	rawEvents := make([]*persistence.RawChainEventInput, 0, len(logs))
 	txHashMap := make(map[common.Hash]bool)
 
 	for _, log := range logs {
 		blockTime := timestampCache[log.BlockNumber]
-		transfer, err := ti.decoder.DecodeTransfer(ti.chainID, log, blockTime)
-		if err != nil {
-			return nil, fmt.Errorf("decode log at block %d tx %s log index %d: %w",
-				log.BlockNumber, log.TxHash.Hex(), log.Index, err)
-		}
-		transfers = append(transfers, transfer)
-		txHashMap[log.TxHash] = true
 
-		rawEvents = append(rawEvents, &persistence.RawChainEventInput{
-			ContractAddress: ti.tokenAddress,
-			EventName:       "Transfer",
-			TxHash:          log.TxHash,
-			BlockNumber:     log.BlockNumber,
-			BlockTimestamp:  blockTime,
-			LogIndex:        log.Index,
-			Removed:         log.Removed,
-			RawData: map[string]interface{}{
-				"from":   transfer.FromAddress.Hex(),
-				"to":     transfer.ToAddress.Hex(),
-				"amount": transfer.Amount.String(),
-			},
-		})
+		if len(log.Topics) > 0 && log.Topics[0] == ti.decoder.TransferTopic() {
+			transfer, err := ti.decoder.DecodeTransfer(ti.chainID, log, blockTime)
+			if err != nil {
+				return nil, fmt.Errorf("decode transfer log at block %d tx %s log index %d: %w",
+					log.BlockNumber, log.TxHash.Hex(), log.Index, err)
+			}
+			transfers = append(transfers, transfer)
+			txHashMap[log.TxHash] = true
+
+			rawEvents = append(rawEvents, &persistence.RawChainEventInput{
+				ContractAddress: ti.tokenAddress,
+				EventName:       "Transfer",
+				TxHash:          log.TxHash,
+				BlockNumber:     log.BlockNumber,
+				BlockTimestamp:  blockTime,
+				LogIndex:        log.Index,
+				Removed:         log.Removed,
+				RawData: map[string]interface{}{
+					"from":   transfer.FromAddress.Hex(),
+					"to":     transfer.ToAddress.Hex(),
+					"amount": transfer.Amount.String(),
+				},
+			})
+		} else if ti.decoder.HasApproval() {
+			apprTopic, ok := ti.decoder.ApprovalTopic()
+			if ok && len(log.Topics) > 0 && log.Topics[0] == apprTopic {
+				approval, err := ti.decoder.DecodeApproval(ti.chainID, log, blockTime)
+				if err != nil {
+					return nil, fmt.Errorf("decode approval log at block %d tx %s log index %d: %w",
+						log.BlockNumber, log.TxHash.Hex(), log.Index, err)
+				}
+				txHashMap[log.TxHash] = true
+
+				rawEvents = append(rawEvents, &persistence.RawChainEventInput{
+					ContractAddress: ti.tokenAddress,
+					EventName:       "Approval",
+					TxHash:          log.TxHash,
+					BlockNumber:     log.BlockNumber,
+					BlockTimestamp:  blockTime,
+					LogIndex:        log.Index,
+					Removed:         log.Removed,
+					RawData: map[string]interface{}{
+						"owner":   approval.Owner.Hex(),
+						"spender": approval.Spender.Hex(),
+						"value":   approval.Value.String(),
+					},
+				})
+			}
+		}
 	}
 
 	// 3. Identify which transactions already exist in the database

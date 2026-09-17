@@ -254,8 +254,17 @@ func (s *Service) IndexRange(
 		}
 
 		// 3. Project event into domain tables (employees, employers, payroll_fundings, salary_claims)
-		if err := s.persistence.ProjectPayrollEvent(ctx, chainID, blockTimestamp, decoded); err != nil {
-			return nil, fmt.Errorf("failed to project payroll event %s at block %d: %w", decoded.Type, log.BlockNumber, err)
+		if !log.Removed {
+			if err := s.persistence.ProjectPayrollEvent(ctx, chainID, blockTimestamp, decoded); err != nil {
+				return nil, fmt.Errorf("failed to project payroll event %s at block %d: %w", decoded.Type, log.BlockNumber, err)
+			}
+		} else {
+			slog.Warn("skipping projection for removed log (reorg)",
+				"event_type", decoded.Type,
+				"tx_hash", log.TxHash.Hex(),
+				"block_number", log.BlockNumber,
+				"log_index", log.Index,
+			)
 		}
 
 		// 4. Structured log for EmployeeAdded events

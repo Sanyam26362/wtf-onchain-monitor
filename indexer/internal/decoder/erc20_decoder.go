@@ -64,3 +64,23 @@ func (d *ERC20Decoder) DecodeTransfer(
 		Removed:        log.Removed,
 	}, nil
 }
+
+// HasApproval returns true if the filterer has the Approval event configured.
+func (d *ERC20Decoder) HasApproval() bool {
+	_, ok := d.filterer.ApprovalTopic()
+	return ok
+}
+
+// ApprovalTopic returns the Approval event topic keccak256 hash if configured.
+func (d *ERC20Decoder) ApprovalTopic() (common.Hash, bool) {
+	return d.filterer.ApprovalTopic()
+}
+
+// DecodeApproval decodes an Ethereum log into an ERC20ApprovalEvent.
+func (d *ERC20Decoder) DecodeApproval(
+	chainID int64,
+	log types.Log,
+	blockTimestamp time.Time,
+) (*indexerABI.ERC20ApprovalEvent, error) {
+	return d.filterer.ParseApproval(log)
+}

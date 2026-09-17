@@ -14,12 +14,13 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 4. [Environment Configuration](#environment-configuration)
 5. [Generic ERC-20 Token Indexing](#generic-erc-20-token-indexing)
 6. [Quick Start & Running Services](#quick-start--running-services)
-7. [REST API Reference](#rest-api-reference)
-8. [API Testing with Postman & cURL](#api-testing-with-postman--curl)
-9. [Automated Testing](#automated-testing)
-10. [Security Notes](#security-notes)
-11. [Troubleshooting](#troubleshooting)
-12. [Roadmap](#roadmap)
+7. [Continuous Live Monitoring](#continuous-live-monitoring)
+8. [REST API Reference](#rest-api-reference)
+9. [API Testing with Postman & cURL](#api-testing-with-postman--curl)
+10. [Automated Testing](#automated-testing)
+11. [Security Notes](#security-notes)
+12. [Troubleshooting](#troubleshooting)
+13. [Roadmap](#roadmap)
 
 ---
 
@@ -31,8 +32,7 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 - [x] Checkpointing/idempotency (Atomic stream progress tracking in `sync_checkpoints`)
 - [x] REST API (`net/http.ServeMux` Go 1.22+, zero RPC calls on historical GET requests)
 - [x] API validation/pagination (Address format, tx hash, bounded pagination, whitelisted sorting)
-- [x] OpenAPI documentation (OpenAPI 3.0 specification in [`docs/openapi.yaml`](docs/openapi.yaml))
-- [ ] Continuous live monitoring (Background daemon for real-time finalized block synchronization)
+- [x] Continuous live monitoring (Background daemon for real-time finalized block synchronization)
 - [ ] Reconciliation engine (Automated balance auditing and database drift detection)
 - [ ] Dashboard/product integration (Next.js frontend user interface)
 
@@ -47,7 +47,7 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 | **Validation & Middleware** | Completed | Request ID tracing, CORS, structured slog logging, panic recovery, and parameter validation |
 | **Operator Protection** | Completed | Protected operator endpoints (`/v1/sync/backfill`) secured by API key authentication |
 | **OpenAPI 3.0 Documentation**| Completed | Complete specification located at [`docs/openapi.yaml`](docs/openapi.yaml) |
-| **Continuous Live Monitoring**| Next | Background daemon polling and indexing incoming finalized blocks in real time |
+| **Continuous Live Monitoring**| Completed | Continuous polling loop indexing incoming safe blocks with configurable confirmation depth |
 | **Reconciliation Engine** | Next | Asynchronous worker auditing database state against on-chain contract state |
 | **Dashboard UI** | Future | Next.js monitoring dashboard integration |
 
@@ -246,6 +246,233 @@ go build -o bin/api.exe ./cmd/api
 ./bin/api.exe
 ```
 The server will start on `http://0.0.0.0:8080`. Graceful shutdown handles `SIGINT` and `SIGTERM` signals with an in-flight request timeout.
+
+---
+
+## Continuous Live Monitoring
+
+Milestone 3 (M3) adds continuous background live monitoring after historical synchronization. The live monitor continuously polls Ethereum Sepolia for newly confirmed safe blocks, detects relevant events across independent contract streams, persists records idempotently, and atomically updates durable checkpoints.
+
+```text
+               ┌───────────────────────────────┐
+               │    Ethereum Sepolia Node      │
+               └───────────────┬───────────────┘
+                               │ eth_blockNumber (latestBlock)
+                               ▼
+               ┌───────────────────────────────┐
+               │   Calculate Safe Head Block   │ ◄── safeTarget = latestBlock - confirmations
+               └───────────────┬───────────────┘
+                               │
+                ┌──────────────┴──────────────┐
+                ▼                             ▼
+   ┌───────────────────────────┐ ┌───────────────────────────┐
+   │  MonthlyPayroll Stream    │ │      WTF Token Stream     │
+   │ (stream: monthly_payroll) │ │ (stream: erc20_transfers) │
+   └────────────┬──────────────┘ └────────────┬──────────────┘
+                │                             │
+                ▼                             ▼
+   ┌───────────────────────────┐ ┌───────────────────────────┐
+   │ Checkpoint Resumption     │ │ Checkpoint Resumption     │
+   │ nextBlock = cp + 1        │ │ nextBlock = cp + 1        │
+   └────────────┬──────────────┘ └────────────┬──────────────┘
+                │                             │
+                ▼                             ▼
+   ┌───────────────────────────┐ ┌───────────────────────────┐
+   │ Bounded Range Batching    │ │ Bounded Range Batching    │
+   │ [from, min(from+batch,T)] │ │ [from, min(from+batch,T)] │
+   └────────────┬──────────────┘ └────────────┬──────────────┘
+                │                             │
+                ▼                             ▼
+   ┌───────────────────────────┐ ┌───────────────────────────┐
+   │ Filter & Decode Logs      │ │ Filter & Decode Logs      │
+   │ - EmployerAdded/Removed   │ │ - Transfer                │
+   │ - EmployeeAdded/Removed   │ │ - Approval                │
+   │ - PayrollFunded/Claimed   │ │                           │
+   └────────────┬──────────────┘ └────────────┬──────────────┘
+                │                             │
+                ▼                             ▼
+   ┌───────────────────────────┐ ┌───────────────────────────┐
+   │ Idempotent Persistence    │ │ Idempotent Atomic Batch   │
+   │ - transactions            │ │ - transactions            │
+   │ - chain_events            │ │ - chain_events            │
+   │ - domain tables           │ │ - token_transfers         │
+   │ - sync_checkpoints        │ │ - sync_checkpoints        │
+   └────────────┬──────────────┘ └────────────┬──────────────┘
+                │                             │
+                └──────────────┬──────────────┘
+                               │
+                               ▼
+               ┌───────────────────────────────┐
+               │ Sleep for LIVE_POLL_INTERVAL  │ (e.g. 5s, cancellable on SIGINT/SIGTERM)
+               └───────────────┬───────────────┘
+                               │
+                               ▼
+                       Repeat Loop Cycle
+```
+
+### Key Architectural Characteristics
+
+1. **Continuous Polling Loop**:
+   - Executes at a configurable frequency (`LIVE_POLL_INTERVAL`, default: `5s`).
+   - Runs uninterrupted until a termination signal (`SIGINT` / `SIGTERM` / `Ctrl+C`) is received.
+   - Non-blocking cooperative streaming: each stream processes bounded batches per poll cycle, preventing either stream from starving the other.
+
+2. **Finalized & Safe Block Handling (Confirmation Depth)**:
+   - To guard against chain reorgs, the monitor never queries the unconfirmed block head.
+   - Computes safe block target: `safeTarget = latestBlock - CONFIRMATIONS` (default: `CONFIRMATIONS=5`).
+   - Only blocks `<= safeTarget` are ever requested or indexed.
+
+3. **Checkpoint-Based Resumption**:
+   - On startup, the monitor inspects `sync_checkpoints` for each stream.
+   - Resumes strictly from `nextBlock = last_indexed_block + 1`.
+   - Never restarts from the genesis/deployment block once initial historical synchronization is recorded.
+   - If no checkpoint is found, it safely falls back to the stream's configured start block.
+
+4. **Separate & Independent Streams**:
+   - `monthly_payroll`: Tracks `0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC` events.
+   - `erc20_transfers_0x378AFb93CaDd39AFF154704d2D90Af8c401137E7`: Tracks WTF Token transfers and approvals.
+   - Checkpoints are isolated by `(chain_id, stream_id)`. An error or lag in one stream never corrupts or blocks the other stream.
+
+5. **Bounded Block Ranges**:
+   - Never requests an unbounded range from RPC.
+   - Ranges are segmented by `INDEXER_BATCH_SIZE` (or `BLOCK_BATCH_SIZE`, default: 50 blocks).
+   - If checkpoint is `11724713` and `safeTarget` is `11724820`:
+     - Batch 1: `11724714 -> 11724763`
+     - Batch 2: `11724764 -> 11724813`
+     - Batch 3: `11724814 -> 11724820`
+
+6. **Atomic Checkpointing**:
+   - Checkpoints advance **only after** all logs in the batch have been successfully decoded and committed to PostgreSQL.
+   - For token transfers, metadata, raw events, transfers, and the checkpoint record are committed in a single SQL transaction (`SaveTokenBatch`).
+   - If any database operation fails, the transaction rolls back, and the checkpoint remains at the previous block.
+
+7. **Idempotency & Replay Safety**:
+   - Uniqueness constraints:
+     - `chain_events`: `UNIQUE(chain_id, contract_address, tx_hash, log_index)`
+     - `token_transfers`: `UNIQUE(chain_id, token, tx_hash, log_index)`
+     - `transactions`: `PRIMARY KEY(chain_id, tx_hash)`
+     - `payroll_fundings`: `UNIQUE(chain_id, tx_hash, log_index)`
+     - `salary_claims`: `UNIQUE(chain_id, tx_hash, log_index)`
+   - Replaying any range results in 0 duplicate records.
+
+8. **RPC Failure & Resilient Retry**:
+   - RPC requests utilize exponential backoff and rate-limit handling (including HTTP 429 backoff).
+   - Temporary RPC network outages do not advance checkpoints and do not terminate the process.
+   - The monitor logs the error, pauses, and safely resumes upon RPC recovery.
+
+9. **Blockchain Reorg & Removed Log Handling**:
+   - Both `chain_events` and `token_transfers` include a `removed BOOLEAN` column.
+   - `ON CONFLICT DO UPDATE SET removed = EXCLUDED.removed` updates previously recorded logs if a reorg marks them removed.
+   - MonthlyPayroll domain projection skips any logs where `log.Removed == true`, preventing reorged transactions from falsely altering employee/employer balances.
+   - Confirmation depth (`CONFIRMATIONS=5`) acts as the primary defense against shallow PoS reorgs.
+
+10. **Events Monitored**:
+    - **MonthlyPayroll**: `EmployerAdded`, `EmployerRemoved`, `EmployeeAdded`, `EmployeeRemoved`, `PayrollFunded`, `SalaryClaimed`, `OwnershipTransferred`.
+    - **WTF Token (ERC-20)**: `Transfer`, `Approval`.
+
+11. **Graceful Shutdown**:
+    - Intercepts `SIGINT` (Ctrl+C) and `SIGTERM`.
+    - Completes the in-flight atomic database operation cleanly before closing client connections.
+    - Zero checkpoint state corruption on shutdown.
+
+---
+
+### Starting Live Monitoring
+
+#### Option A: Using the CLI Flag (Recommended)
+```bash
+cd indexer
+
+# Start continuous live monitoring for all configured streams
+go run ./cmd/indexer --live
+
+# Start with custom poll interval and confirmation depth
+go run ./cmd/indexer --live --poll-interval=5s --confirmations=5 --batch-size=50
+
+# Monitor only the WTF Token stream
+go run ./cmd/indexer --live --stream token
+
+# Monitor only the MonthlyPayroll stream
+go run ./cmd/indexer --live --stream payroll
+```
+
+#### Option B: Using Environment Variables
+```bash
+cd indexer
+
+LIVE_MONITOR_ENABLED=true LIVE_POLL_INTERVAL=5s CONFIRMATIONS=5 go run ./cmd/indexer
+```
+
+#### Option C: Built Executable
+```bash
+cd indexer
+go build -o bin/indexer.exe ./cmd/indexer
+./bin/indexer.exe --live --poll-interval=5s
+```
+
+---
+
+### Live Monitoring Configuration Reference
+
+| Variable | CLI Flag | Default | Description |
+|---|---|---|---|
+| `LIVE_MONITOR_ENABLED` | `--live` | `false` | When `true`, indexer enters continuous live polling mode |
+| `LIVE_POLL_INTERVAL` | `--poll-interval` | `5s` | Sleep duration between polling cycles (e.g. `5s`, `10s`) |
+| `CONFIRMATIONS` / `CONFIRMATION_DEPTH` | `--confirmations` | `5` | Block confirmation depth for safe head calculation |
+| `INDEXER_BATCH_SIZE` / `BLOCK_BATCH_SIZE` | `--batch-size` | `50` | Maximum number of blocks fetched per RPC batch |
+| `STREAM` | `--stream` | `all` | Specific stream to index: `payroll`, `token`, or `all` |
+| `TOKEN_STREAM_ID` | N/A | `erc20_transfers_<addr>` | Stream ID for WTF token checkpoint tracking |
+| `PAYROLL_STREAM_ID` | N/A | `monthly_payroll` | Stream ID for MonthlyPayroll checkpoint tracking |
+
+---
+
+### Verifying Synchronization Status via REST API
+
+While the live monitor runs, you can check live sync progress in real time through the REST API.
+
+Start the API in a separate terminal:
+```bash
+cd indexer
+go run ./cmd/api
+```
+
+Query the synchronization status:
+```bash
+curl -s http://localhost:8080/v1/sync/status | jq .
+```
+
+Example response showing real-time sync checkpoints and zero lag:
+```json
+{
+  "data": {
+    "chain_id": 11155111,
+    "latest_block": 11725138,
+    "safe_block": 11725133,
+    "streams": [
+      {
+        "stream_id": "erc20_transfers_0x378AFb93CaDd39AFF154704d2D90Af8c401137E7",
+        "token": "0x378AFb93CaDd39AFF154704d2D90Af8c401137E7",
+        "last_indexed_block": 11725133,
+        "lag": 0,
+        "status": "synced"
+      },
+      {
+        "stream_id": "monthly_payroll",
+        "last_indexed_block": 11081900,
+        "lag": 643233,
+        "status": "catching_up"
+      }
+    ],
+    "last_error": null
+  }
+}
+```
+
+Check health and readiness:
+```bash
+curl -s http://localhost:8080/health
+curl -s http://localhost:8080/ready
+```
 
 ---
 
