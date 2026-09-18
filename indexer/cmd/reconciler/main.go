@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 )
 
 func main() {
+	typeFlag := flag.String("type", "payroll", "Reconciliation type: 'payroll' (or 'payroll-funding'), 'salary-claims' (or 'salary-claim'), or 'all'")
 	fromBlockFlag := flag.Uint64("from-block", 0, "Start block for reconciliation range")
 	toBlockFlag := flag.Uint64("to-block", 0, "Target block for reconciliation range")
 	windowFlag := flag.Uint64("window", 0, "Reconcile recent block window (e.g. 500)")
@@ -37,8 +39,20 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
+	normType := strings.ToLower(strings.TrimSpace(*typeFlag))
+	switch normType {
+	case "payroll", "payroll-funding", "funding":
+		normType = "payroll"
+	case "salary-claims", "salary-claim", "claims", "claim":
+		normType = "salary-claims"
+	case "all", "both":
+		normType = "all"
+	default:
+		log.Fatalf("unsupported reconciliation type %q: must be 'payroll', 'salary-claims', or 'all'", *typeFlag)
+	}
+
 	fmt.Println("==================================================")
-	fmt.Println("WTF Reconciliation Worker — Payroll Funding Check")
+	fmt.Printf("WTF Reconciliation Worker — Type: %s\n", strings.ToUpper(normType))
 	fmt.Println("==================================================")
 
 	if err := godotenv.Load(); err != nil {
@@ -83,38 +97,74 @@ func main() {
 		log.Fatalf("failed to initialize event decoder: %v", err)
 	}
 
-	reconCfg := reconciliation.PayrollReconcilerConfig{
-		ChainID:           cfg.ChainID,
-		ContractAddress:   contractAddr,
-		PayrollStreamID:   cfg.PayrollStreamID,
-		ReconStreamID:     cfg.ReconciliationStreamID,
-		ConfirmationDepth: cfg.ConfirmationDepth,
-		BlockWindow:       cfg.ReconciliationBlockWindow,
-		StartBlock:        cfg.StartBlock,
-	}
-
-	reconciler, err := reconciliation.NewPayrollReconciler(
-		reconCfg,
-		client,
-		eventDecoder,
-		payrollRepo,
-		reconRepo,
-		db,
-	)
-	if err != nil {
-		log.Fatalf("failed to initialize reconciler: %v", err)
-	}
-	reconciler.SetRetryPolicy(indexer.RetryPolicy{
+	retryPolicy := indexer.RetryPolicy{
 		MaxRetries:     cfg.RPCMaxRetries,
 		InitialBackoff: cfg.RPCInitialBackoff,
 		MaxBackoff:     cfg.RPCMaxBackoff,
 		BackoffFactor:  cfg.RPCBackoffFactor,
 		Sleeper:        indexer.DefaultSleeper,
-	})
+	}
+
+	var payrollReconciler *reconciliation.PayrollReconciler
+	if normType == "payroll" || normType == "all" {
+		reconCfg := reconciliation.PayrollReconcilerConfig{
+			ChainID:           cfg.ChainID,
+			ContractAddress:   contractAddr,
+			PayrollStreamID:   cfg.PayrollStreamID,
+			ReconStreamID:     cfg.ReconciliationStreamID,
+			ConfirmationDepth: cfg.ConfirmationDepth,
+			BlockWindow:       cfg.ReconciliationBlockWindow,
+			StartBlock:        cfg.StartBlock,
+		}
+
+		payrollReconciler, err = reconciliation.NewPayrollReconciler(
+			reconCfg,
+			client,
+			eventDecoder,
+			payrollRepo,
+			reconRepo,
+			db,
+		)
+		if err != nil {
+			log.Fatalf("failed to initialize payroll reconciler: %v", err)
+		}
+		payrollReconciler.SetRetryPolicy(retryPolicy)
+	}
+
+	var salaryClaimReconciler *reconciliation.SalaryClaimReconciler
+	if normType == "salary-claims" || normType == "all" {
+		claimReconCfg := reconciliation.SalaryClaimReconcilerConfig{
+			ChainID:           cfg.ChainID,
+			ContractAddress:   contractAddr,
+			PayrollStreamID:   cfg.PayrollStreamID,
+			ReconStreamID:     cfg.ReconciliationSalaryClaimStreamID,
+			ConfirmationDepth: cfg.ConfirmationDepth,
+			BlockWindow:       cfg.ReconciliationBlockWindow,
+			StartBlock:        cfg.StartBlock,
+		}
+
+		salaryClaimReconciler, err = reconciliation.NewSalaryClaimReconciler(
+			claimReconCfg,
+			client,
+			eventDecoder,
+			payrollRepo,
+			reconRepo,
+			db,
+		)
+		if err != nil {
+			log.Fatalf("failed to initialize salary claim reconciler: %v", err)
+		}
+		salaryClaimReconciler.SetRetryPolicy(retryPolicy)
+	}
 
 	fmt.Printf("Chain ID:                %d\n", cfg.ChainID)
 	fmt.Printf("Payroll Contract:        %s\n", cfg.PayrollContractAddress)
-	fmt.Printf("Stream ID:               %s\n", cfg.ReconciliationStreamID)
+	if payrollReconciler != nil {
+		fmt.Printf("Payroll Recon Stream ID: %s\n", cfg.ReconciliationStreamID)
+	}
+	if salaryClaimReconciler != nil {
+		fmt.Printf("Claim Recon Stream ID:   %s\n", cfg.ReconciliationSalaryClaimStreamID)
+	}
 	fmt.Printf("Confirmation Depth:      %d\n", cfg.ConfirmationDepth)
 	if *loopFlag {
 		fmt.Printf("Mode:                    CONTINUOUS RECONCILIATION LOOP (interval %s)\n", interval)
@@ -128,26 +178,51 @@ func main() {
 	fmt.Println("--------------------------------------------------")
 
 	executePass := func() error {
-		var res *reconciliation.ReconciliationResult
-		var pErr error
+		if payrollReconciler != nil {
+			var res *reconciliation.ReconciliationResult
+			var pErr error
 
-		if *windowFlag > 0 {
-			res, pErr = reconciler.ReconcileRecentWindow(ctx, *windowFlag)
-		} else if *fromBlockFlag > 0 && *toBlockFlag > 0 {
-			res, pErr = reconciler.ReconcileRange(ctx, *fromBlockFlag, *toBlockFlag)
-		} else {
-			batchSize := cfg.BlockBatchSize
-			if *batchSizeFlag > 0 {
-				batchSize = *batchSizeFlag
+			if *windowFlag > 0 {
+				res, pErr = payrollReconciler.ReconcileRecentWindow(ctx, *windowFlag)
+			} else if *fromBlockFlag > 0 && *toBlockFlag > 0 {
+				res, pErr = payrollReconciler.ReconcileRange(ctx, *fromBlockFlag, *toBlockFlag)
+			} else {
+				batchSize := cfg.BlockBatchSize
+				if *batchSizeFlag > 0 {
+					batchSize = *batchSizeFlag
+				}
+				res, pErr = payrollReconciler.ReconcileNextBatch(ctx, batchSize)
 			}
-			res, pErr = reconciler.ReconcileNextBatch(ctx, batchSize)
+
+			if pErr != nil {
+				return fmt.Errorf("payroll reconciliation failed: %w", pErr)
+			}
+
+			printSummary("Payroll Funding Reconciliation", res)
 		}
 
-		if pErr != nil {
-			return pErr
-		}
+		if salaryClaimReconciler != nil {
+			var res *reconciliation.ReconciliationResult
+			var sErr error
 
-		printSummary(res)
+			if *windowFlag > 0 {
+				res, sErr = salaryClaimReconciler.ReconcileRecentWindow(ctx, *windowFlag)
+			} else if *fromBlockFlag > 0 && *toBlockFlag > 0 {
+				res, sErr = salaryClaimReconciler.ReconcileRange(ctx, *fromBlockFlag, *toBlockFlag)
+			} else {
+				batchSize := cfg.BlockBatchSize
+				if *batchSizeFlag > 0 {
+					batchSize = *batchSizeFlag
+				}
+				res, sErr = salaryClaimReconciler.ReconcileNextBatch(ctx, batchSize)
+			}
+
+			if sErr != nil {
+				return fmt.Errorf("salary claim reconciliation failed: %w", sErr)
+			}
+
+			printSummary("Salary Claim Reconciliation", res)
+		}
 		return nil
 	}
 
@@ -181,11 +256,11 @@ func main() {
 	}
 }
 
-func printSummary(res *reconciliation.ReconciliationResult) {
+func printSummary(title string, res *reconciliation.ReconciliationResult) {
 	if res == nil {
 		return
 	}
-	fmt.Printf("\n--- Reconciliation Summary ---\n")
+	fmt.Printf("\n--- %s Summary ---\n", title)
 	fmt.Printf("Block Range Checked:     %d -> %d\n", res.FromBlock, res.ToBlock)
 	fmt.Printf("Safe Target Block:       %d\n", res.SafeTarget)
 	fmt.Printf("Indexer Checkpoint:      %d\n", res.IndexerCheckpoint)

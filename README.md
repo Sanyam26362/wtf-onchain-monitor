@@ -33,7 +33,8 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 - [x] REST API (`net/http.ServeMux` Go 1.22+, zero RPC calls on historical GET requests)
 - [x] API validation/pagination (Address format, tx hash, bounded pagination, whitelisted sorting)
 - [x] Continuous live monitoring (Background daemon for real-time finalized block synchronization)
-- [ ] Reconciliation engine (Automated balance auditing and database drift detection)
+- [x] Reconciliation engine — Payroll Funding & Salary Claim verification (`reconciliation_exceptions`)
+- [ ] Reconciliation engine — ERC-20 Transfer & Balance verification
 - [ ] Dashboard/product integration (Next.js frontend user interface)
 
 | Feature / Milestone | Status | Description |
@@ -48,7 +49,9 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 | **Operator Protection** | Completed | Protected operator endpoints (`/v1/sync/backfill`) secured by API key authentication |
 | **OpenAPI 3.0 Documentation**| Completed | Complete specification located at [`docs/openapi.yaml`](docs/openapi.yaml) |
 | **Continuous Live Monitoring**| Completed | Continuous polling loop indexing incoming safe blocks with configurable confirmation depth |
-| **Reconciliation Engine** | Next | Asynchronous worker auditing database state against on-chain contract state |
+| **Payroll Funding Reconciler**| Completed | Independent audit comparing on-chain `PayrollFunded` events to database records |
+| **Salary Claim Reconciler** | Completed | Independent audit comparing on-chain `SalaryClaimed` events to database records |
+| **Token Transfer Reconciler** | Next | Independent audit comparing on-chain ERC-20 `Transfer` events to database records |
 | **Dashboard UI** | Future | Next.js monitoring dashboard integration |
 
 ---
@@ -516,17 +519,24 @@ curl -s http://localhost:8080/ready
 
 ---
 
-## Reconciliation Worker — Payroll Funding Safety Check
+## Reconciliation Worker — Payroll Funding & Salary Claim Safety Checks
 
 The **Reconciliation Worker** acts as the safety check and audit layer for the WTF On-Chain Monitor. It compares authoritative on-chain state against observed/indexed PostgreSQL database data and creates structured, idempotent exceptions in `reconciliation_exceptions` whenever a mismatch is detected.
 
 > **Key Architectural Principle**: The reconciliation worker checks the indexer — it is not a second indexer. It does not silently insert missing rows; it surfaces discrepancies for operational visibility and auditability.
 
-### Domain Rule: Smart Contract Storage vs Authoritative Events
-The `MonthlyPayroll` smart contract (`0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC`) maintains running state mappings (`employers`, `employees`, `payrolls`), but **does not expose an iterable historical funding array or transaction ledger in contract storage**. Therefore, the authoritative source of truth for individual funding event transactions is the immutable `PayrollFunded` event emitted in transaction receipts on the blockchain. The reconciler decodes these authoritative on-chain logs and verifies them against the indexed `payroll_fundings` table in PostgreSQL.
+### Domain Rules: Smart Contract Storage vs Authoritative Events
+The `MonthlyPayroll` smart contract (`0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC`) maintains running state mappings (`employers`, `employees`, `payrolls`), but **does not expose an iterable historical ledger in contract storage** for past individual funding or claim transactions. 
+
+Therefore, the authoritative source of truth for historical transactions is the immutable sequence of event logs emitted in transaction receipts on the blockchain:
+- **Payroll Funding**: `event PayrollFunded(address indexed employer, address indexed employee, uint256 amount, uint256 fee, uint256 amountCredited)`
+- **Salary Claims**: `event SalaryClaimed(address indexed employee, uint256 amount)`
+
+The reconciler decodes these authoritative on-chain logs and verifies them against the respective indexed database tables (`payroll_fundings` and `salary_claims`) in PostgreSQL.
 
 ### Discrepancy Classification & Severities
 
+#### 1. Payroll Funding Discrepancies
 | Mismatch Type | Severity | Description |
 | :--- | :--- | :--- |
 | `PAYROLL_FUNDING_MISSING` | `high` | On-chain `PayrollFunded` event exists within finalized range and indexer checkpoint, but is absent from `payroll_fundings`. |
@@ -535,41 +545,80 @@ The `MonthlyPayroll` smart contract (`0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC
 | `PAYROLL_FUNDING_DUPLICATE` | `high` | Multiple database records exist for the same on-chain `(chain_id, tx_hash, log_index)`. |
 | `PAYROLL_FUNDING_TX_INCONSISTENCY` | `medium` | Block number or transaction metadata differs between blockchain log and database record. |
 
+#### 2. Salary Claim Discrepancies
+| Mismatch Type | Severity | Description |
+| :--- | :--- | :--- |
+| `SALARY_CLAIM_MISSING` | `high` | On-chain `SalaryClaimed` event exists within finalized range and indexer checkpoint, but is absent from `salary_claims`. |
+| `SALARY_CLAIM_AMOUNT_MISMATCH` | `high` | Discrepancy in `amount` between on-chain event and database record. |
+| `SALARY_CLAIM_ENTITY_MISMATCH` | `critical` | Employee wallet address mismatch between on-chain event and database record. |
+| `SALARY_CLAIM_DUPLICATE` | `high` | Multiple database records exist for the same on-chain `(chain_id, tx_hash, log_index)`. |
+| `SALARY_CLAIM_TX_INCONSISTENCY` | `medium` | Block number or transaction metadata differs between blockchain log and database record. |
+
 ### Lifecycle & Safety Features
 - **Distinguishing Indexing Lag vs Genuine Mismatches**: If an on-chain event is on a block higher than the indexer's checkpoint (`block > indexerCheckpoint`), it is classified as normal indexing lag, not an error, and is not flagged as missing.
 - **Reorganization Safety (Confirmation Depth)**: Any blocks above `safeTarget = latestBlock - confirmationDepth` are ignored as unfinalized.
 - **System Failure Isolation**: RPC timeouts or database connection drops return clean system errors and abort the run without generating false data mismatch exceptions.
+- **Durable Checkpoint Isolation**:
+  - `reconciliation_payroll_funding`: Checkpoint cursor for payroll funding reconciliation.
+  - `reconciliation_salary_claim`: Checkpoint cursor for salary claim reconciliation.
 - **Idempotency**: Exception entity references follow a deterministic format (`chain_id:tx_hash:log_index:mismatch_type`). Repeated runs skip already open exceptions without creating duplicate rows.
-- **Automated Lifecycle Resolution**: When a subsequent reconciliation pass detects that a previously open mismatch has been resolved (e.g. after indexer backfill), it marks the exception `status = 'resolved'` and records `resolved_at`.
+- **Automated Lifecycle Resolution**: When a subsequent reconciliation pass detects that a previously open mismatch has been resolved (e.g. after indexer backfill or fix), it marks the exception `status = 'resolved'` and records `resolved_at`.
 
 ### Running the Reconciliation Worker
 
-#### 1. Explicit Range Check
+#### 1. Salary Claim Reconciliation
 ```bash
 cd indexer
+
+# Reconcile an explicit block range
+go run ./cmd/reconciler -type salary-claims -from-block 11080692 -to-block 11084000
+
+# Reconcile recent finalized window
+go run ./cmd/reconciler -type salary-claims -window 500
+
+# Continuous reconciliation daemon loop
+go run ./cmd/reconciler -type salary-claims -loop -interval 30s
+```
+
+#### 2. Payroll Funding Reconciliation
+```bash
+# Explicit range
+go run ./cmd/reconciler -type payroll -from-block 11080692 -to-block 11084000
+
+# Defaults to payroll funding for backwards compatibility:
 go run ./cmd/reconciler -from-block 11080692 -to-block 11084000
 ```
-Or via the indexer CLI:
+
+#### 3. Dual / All Reconciliation Checks
 ```bash
-go run ./cmd/indexer -reconcile -from-block 11080692 -to-block 11084000
+# Run both Payroll Funding and Salary Claim checks
+go run ./cmd/reconciler -type all -from-block 11080692 -to-block 11084000
+
+# Continuous multi-check daemon
+go run ./cmd/reconciler -type all -loop -interval 30s
 ```
 
-#### 2. Recent Finalized Window Check
+#### 4. Running via Indexer CLI
 ```bash
-go run ./cmd/reconciler -window 500
+# Reconcile salary claims
+go run ./cmd/indexer -reconcile -recon-type salary-claims -from-block 11080692 -to-block 11084000
+
+# Reconcile all checks
+go run ./cmd/indexer -reconcile -recon-type all
 ```
 
-#### 3. Continuous Reconciliation Daemon Loop
-```bash
-go run ./cmd/reconciler -loop -interval 30s
-```
-
-#### 4. Querying Exceptions via REST API
+#### 5. Querying Exceptions via REST API
 ```bash
 # View open high-severity exceptions
 curl -s "http://localhost:8080/v1/reconciliation/exceptions?status=open&severity=high" | jq .
 
-# View all reconciliation exceptions
+# Filter specifically for salary claim discrepancies
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?type=SALARY_CLAIM_MISSING" | jq .
+
+# View critical entity mismatches
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?severity=critical" | jq .
+
+# View all reconciliation exceptions paginated
 curl -s "http://localhost:8080/v1/reconciliation/exceptions?page=1&page_size=20" | jq .
 ```
 
@@ -1007,10 +1056,10 @@ go test -v -count=1 ./...
 
 - [x] Continuous synchronization live monitor daemon
 - [x] Automated Reconciliation Engine — Payroll Funding (`internal/reconciliation`)
+- [x] Automated Reconciliation Engine — Salary Claims (`internal/reconciliation`)
 - [x] Automated detection, classification, and resolution in `reconciliation_exceptions`
 
 ### Next
-- [ ] Salary Claim Reconciliation
 - [ ] ERC-20 Token Transfer & Balance Reconciliation
 - [ ] Reorganization detection and event rollback handling
 

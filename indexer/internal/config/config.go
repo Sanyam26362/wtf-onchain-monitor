@@ -47,10 +47,11 @@ type Config struct {
 	RPCBackoffFactor  float64
 
 	// Reconciliation Configuration
-	ReconciliationEnabled     bool
-	ReconciliationBlockWindow uint64
-	ReconciliationInterval    time.Duration
-	ReconciliationStreamID    string
+	ReconciliationEnabled             bool
+	ReconciliationBlockWindow         uint64
+	ReconciliationInterval            time.Duration
+	ReconciliationStreamID            string
+	ReconciliationSalaryClaimStreamID string
 
 	// ParsedTokenABI is populated and cached after successful validation.
 	ParsedTokenABI *abi.ABI
@@ -254,38 +255,44 @@ func Load() (Config, error) {
 		reconStreamID = "reconciliation_payroll_funding"
 	}
 
+	reconSalaryClaimStreamID := os.Getenv("RECONCILIATION_SALARY_CLAIM_STREAM_ID")
+	if reconSalaryClaimStreamID == "" {
+		reconSalaryClaimStreamID = "reconciliation_salary_claim"
+	}
+
 	cfg := Config{
-		ChainID:                   chainID,
-		RPCURL:                    rpcURL,
-		PayrollContractAddress:    payrollContract,
-		TokenAddress:              tokenAddress,
-		TokenABIPath:              tokenABIPath,
-		TokenABIJSON:              tokenABIJSON,
-		TokenStartBlock:           tokenStartBlock,
-		TokenStreamID:             tokenStreamID,
-		StartBlock:                startBlock,
-		BackfillToBlock:           backfillToBlock,
-		PayrollStreamID:           payrollStreamID,
-		ConfirmationDepth:         confirmationDepth,
-		BlockBatchSize:            blockBatchSize,
-		DatabaseURL:               dbURL,
-		PollingInterval:           pollingInterval,
-		LiveMonitorEnabled:        liveMonitorEnabled,
-		LivePollInterval:          livePollInterval,
-		DeploymentEnvironment:     env,
-		APIHost:                   apiHost,
-		APIPort:                   apiPort,
-		CORSAllowedOrigins:        corsOrigins,
-		ExplorerTxURLTemplate:     explorerTemplate,
-		OperatorAPIKey:            operatorKey,
-		RPCMaxRetries:             rpcMaxRetries,
-		RPCInitialBackoff:         rpcInitialBackoff,
-		RPCMaxBackoff:             rpcMaxBackoff,
-		RPCBackoffFactor:          rpcBackoffFactor,
-		ReconciliationEnabled:     reconEnabled,
-		ReconciliationBlockWindow: reconBlockWindow,
-		ReconciliationInterval:    reconInterval,
-		ReconciliationStreamID:    reconStreamID,
+		ChainID:                           chainID,
+		RPCURL:                            rpcURL,
+		PayrollContractAddress:            payrollContract,
+		TokenAddress:                      tokenAddress,
+		TokenABIPath:                      tokenABIPath,
+		TokenABIJSON:                      tokenABIJSON,
+		TokenStartBlock:                   tokenStartBlock,
+		TokenStreamID:                     tokenStreamID,
+		StartBlock:                        startBlock,
+		BackfillToBlock:                   backfillToBlock,
+		PayrollStreamID:                   payrollStreamID,
+		ConfirmationDepth:                 confirmationDepth,
+		BlockBatchSize:                    blockBatchSize,
+		DatabaseURL:                       dbURL,
+		PollingInterval:                   pollingInterval,
+		LiveMonitorEnabled:                liveMonitorEnabled,
+		LivePollInterval:                  livePollInterval,
+		DeploymentEnvironment:             env,
+		APIHost:                           apiHost,
+		APIPort:                           apiPort,
+		CORSAllowedOrigins:                corsOrigins,
+		ExplorerTxURLTemplate:             explorerTemplate,
+		OperatorAPIKey:                    operatorKey,
+		RPCMaxRetries:                     rpcMaxRetries,
+		RPCInitialBackoff:                 rpcInitialBackoff,
+		RPCMaxBackoff:                     rpcMaxBackoff,
+		RPCBackoffFactor:                  rpcBackoffFactor,
+		ReconciliationEnabled:             reconEnabled,
+		ReconciliationBlockWindow:         reconBlockWindow,
+		ReconciliationInterval:            reconInterval,
+		ReconciliationStreamID:            reconStreamID,
+		ReconciliationSalaryClaimStreamID: reconSalaryClaimStreamID,
 	}
 
 	return cfg, nil

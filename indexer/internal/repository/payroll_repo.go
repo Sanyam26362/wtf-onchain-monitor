@@ -401,3 +401,64 @@ func (r *PayrollRepository) GetFundingsByBlockRange(ctx context.Context, chainID
 
 	return fundings, nil
 }
+
+// GetClaimsByBlockRange retrieves all salary claim records within a block range [fromBlock, toBlock].
+func (r *PayrollRepository) GetClaimsByBlockRange(ctx context.Context, chainID int64, fromBlock, toBlock uint64) ([]*models.SalaryClaim, error) {
+	const query = `
+		SELECT
+			id,
+			employee,
+			amount,
+			tx_hash,
+			block_number,
+			block_timestamp,
+			log_index,
+			chain_id
+		FROM salary_claims
+		WHERE chain_id = $1 AND block_number >= $2 AND block_number <= $3
+		ORDER BY block_number ASC, log_index ASC, id ASC
+	`
+	rows, err := r.pool.Query(ctx, query, chainID, int64(fromBlock), int64(toBlock))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query salary claims by block range: %w", err)
+	}
+	defer rows.Close()
+
+	claims := make([]*models.SalaryClaim, 0)
+	for rows.Next() {
+		var (
+			id             int64
+			employeeStr    string
+			amountStr      string
+			txHashStr      string
+			blockNumber    int64
+			blockTimestamp time.Time
+			logIndex       int
+			cid            int64
+		)
+
+		if err := rows.Scan(&id, &employeeStr, &amountStr, &txHashStr, &blockNumber, &blockTimestamp, &logIndex, &cid); err != nil {
+			return nil, fmt.Errorf("failed to scan claim row: %w", err)
+		}
+
+		amount, _ := new(big.Int).SetString(amountStr, 10)
+
+		claims = append(claims, &models.SalaryClaim{
+			ID:             id,
+			Employee:       common.HexToAddress(employeeStr),
+			Amount:         amount,
+			TxHash:         common.HexToHash(txHashStr),
+			BlockNumber:    uint64(blockNumber),
+			BlockTimestamp: blockTimestamp.UTC(),
+			LogIndex:       uint(logIndex),
+			ChainID:        cid,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading claim rows: %w", err)
+	}
+
+	return claims, nil
+}
+
