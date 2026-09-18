@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"worldtradefuture/indexer/internal/api/handlers"
 	"worldtradefuture/indexer/internal/api/responses"
 	"worldtradefuture/indexer/internal/config"
+	"worldtradefuture/indexer/internal/models"
 	"worldtradefuture/indexer/internal/persistence"
 	"worldtradefuture/indexer/internal/repository"
 )
@@ -441,6 +443,80 @@ func TestDatabaseIntegrationHandlers(t *testing.T) {
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 OK, got: %d", rec.Code)
+		}
+	})
+
+	// 6b. Reconciliation Repository Lifecycle & Payroll Block Range Live DB
+	t.Run("Reconciliation Lifecycle and Block Range Live DB", func(t *testing.T) {
+		recRepo := repository.NewReconciliationRepository(pg.Pool())
+		payrollRepo := repository.NewPayrollRepository(pg.Pool())
+		ctx := context.Background()
+
+		// Test PayrollRepository.GetFundingsByBlockRange
+		fundings, err := payrollRepo.GetFundingsByBlockRange(ctx, cfg.ChainID, 11080000, 11085000)
+		if err != nil {
+			t.Fatalf("GetFundingsByBlockRange error: %v", err)
+		}
+		_ = fundings
+
+		// Test ReconciliationRepository lifecycle
+		entityRef := fmt.Sprintf("11155111:0xdeadbeef%d:0:missing", time.Now().UnixNano())
+		testExc := &models.ReconciliationException{
+			Type:       "PAYROLL_FUNDING_MISSING",
+			Severity:   "high",
+			EntityRef:  entityRef,
+			Expected:   json.RawMessage(`{"amount_paid":"1000","block_number":11080700}`),
+			Observed:   json.RawMessage(`{"status":"not_found"}`),
+			Status:     "open",
+			DetectedAt: time.Now().UTC(),
+		}
+
+		if err := recRepo.CreateException(ctx, testExc); err != nil {
+			t.Fatalf("failed to create test exception: %v", err)
+		}
+		if testExc.ID == 0 {
+			t.Fatalf("expected populated ID on created exception")
+		}
+
+		// Find open exception by entity_ref
+		found, err := recRepo.GetOpenExceptionByEntityRef(ctx, entityRef)
+		if err != nil || found == nil {
+			t.Fatalf("failed to find created exception by entityRef: %v", err)
+		}
+		if found.Status != "open" {
+			t.Fatalf("expected status 'open', got %s", found.Status)
+		}
+
+		// Query by prefix
+		byPrefix, err := recRepo.GetOpenExceptionsByEntityRefPrefix(ctx, "11155111:")
+		if err != nil {
+			t.Fatalf("failed to query exceptions by prefix: %v", err)
+		}
+		if len(byPrefix) == 0 {
+			t.Fatalf("expected at least 1 open exception with prefix 11155111:")
+		}
+
+		// Query via HTTP handler with status=open
+		h := handlers.ReconciliationExceptionsHandler(recRepo, cfg)
+		req := httptest.NewRequest(http.MethodGet, "/v1/reconciliation/exceptions?status=open&severity=high", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK from handler, got %d", rec.Code)
+		}
+
+		// Now resolve the exception
+		if err := recRepo.ResolveException(ctx, testExc.ID, time.Now().UTC()); err != nil {
+			t.Fatalf("failed to resolve exception: %v", err)
+		}
+
+		// Verify it is no longer returned as open
+		openAfter, err := recRepo.GetOpenExceptionByEntityRef(ctx, entityRef)
+		if err != nil {
+			t.Fatalf("error checking open exception after resolve: %v", err)
+		}
+		if openAfter != nil {
+			t.Fatalf("expected nil open exception after resolve, got %+v", openAfter)
 		}
 	})
 

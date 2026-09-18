@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"worldtradefuture/indexer/internal/models"
@@ -169,4 +171,185 @@ func (r *ReconciliationRepository) ListExceptions(ctx context.Context, filter Re
 	}
 
 	return exceptions, total, nil
+}
+
+// CreateException persists a new reconciliation exception and populates its generated ID and DetectedAt.
+func (r *ReconciliationRepository) CreateException(ctx context.Context, exc *models.ReconciliationException) error {
+	status := exc.Status
+	if status == "" {
+		status = "open"
+	}
+	query := `
+		INSERT INTO reconciliation_exceptions (
+			type,
+			severity,
+			entity_ref,
+			expected,
+			observed,
+			status,
+			detected_at,
+			resolved_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), $8)
+		RETURNING id, detected_at
+	`
+	var detectedAt *time.Time
+	if !exc.DetectedAt.IsZero() {
+		t := exc.DetectedAt.UTC()
+		detectedAt = &t
+	}
+	var resolvedAt *time.Time
+	if exc.ResolvedAt != nil {
+		t := exc.ResolvedAt.UTC()
+		resolvedAt = &t
+	}
+
+	err := r.pool.QueryRow(
+		ctx,
+		query,
+		exc.Type,
+		exc.Severity,
+		exc.EntityRef,
+		exc.Expected,
+		exc.Observed,
+		status,
+		detectedAt,
+		resolvedAt,
+	).Scan(&exc.ID, &exc.DetectedAt)
+	if err != nil {
+		return fmt.Errorf("failed to insert reconciliation exception: %w", err)
+	}
+	exc.Status = status
+	exc.DetectedAt = exc.DetectedAt.UTC()
+	return nil
+}
+
+// GetOpenExceptionByEntityRef returns the active open exception for a given entity_ref if one exists.
+func (r *ReconciliationRepository) GetOpenExceptionByEntityRef(ctx context.Context, entityRef string) (*models.ReconciliationException, error) {
+	query := `
+		SELECT
+			id,
+			type,
+			severity,
+			entity_ref,
+			expected,
+			observed,
+			status,
+			detected_at,
+			resolved_at
+		FROM reconciliation_exceptions
+		WHERE entity_ref = $1 AND status = 'open'
+		ORDER BY id DESC
+		LIMIT 1
+	`
+	var (
+		id         int64
+		excType    string
+		severity   string
+		ref        string
+		expected   []byte
+		observed   []byte
+		status     string
+		detectedAt time.Time
+		resolvedAt sql.NullTime
+	)
+	err := r.pool.QueryRow(ctx, query, entityRef).Scan(&id, &excType, &severity, &ref, &expected, &observed, &status, &detectedAt, &resolvedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query open reconciliation exception by entity_ref: %w", err)
+	}
+
+	exc := &models.ReconciliationException{
+		ID:         id,
+		Type:       excType,
+		Severity:   severity,
+		EntityRef:  ref,
+		Expected:   json.RawMessage(expected),
+		Observed:   json.RawMessage(observed),
+		Status:     status,
+		DetectedAt: detectedAt.UTC(),
+	}
+	if resolvedAt.Valid {
+		t := resolvedAt.Time.UTC()
+		exc.ResolvedAt = &t
+	}
+	return exc, nil
+}
+
+// ResolveException marks an existing open reconciliation exception as resolved.
+func (r *ReconciliationRepository) ResolveException(ctx context.Context, id int64, resolvedAt time.Time) error {
+	query := `
+		UPDATE reconciliation_exceptions
+		SET status = 'resolved', resolved_at = $1
+		WHERE id = $2 AND status = 'open'
+	`
+	res, err := r.pool.Exec(ctx, query, resolvedAt.UTC(), id)
+	if err != nil {
+		return fmt.Errorf("failed to resolve reconciliation exception %d: %w", id, err)
+	}
+	_ = res
+	return nil
+}
+
+// GetOpenExceptionsByEntityRefPrefix returns all open exceptions matching an entity_ref prefix.
+func (r *ReconciliationRepository) GetOpenExceptionsByEntityRefPrefix(ctx context.Context, prefix string) ([]*models.ReconciliationException, error) {
+	query := `
+		SELECT
+			id,
+			type,
+			severity,
+			entity_ref,
+			expected,
+			observed,
+			status,
+			detected_at,
+			resolved_at
+		FROM reconciliation_exceptions
+		WHERE entity_ref LIKE $1 || '%' AND status = 'open'
+		ORDER BY id ASC
+	`
+	rows, err := r.pool.Query(ctx, query, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query open exceptions by entity_ref prefix: %w", err)
+	}
+	defer rows.Close()
+
+	var exceptions []*models.ReconciliationException
+	for rows.Next() {
+		var (
+			id         int64
+			excType    string
+			severity   string
+			ref        string
+			expected   []byte
+			observed   []byte
+			status     string
+			detectedAt time.Time
+			resolvedAt sql.NullTime
+		)
+		if err := rows.Scan(&id, &excType, &severity, &ref, &expected, &observed, &status, &detectedAt, &resolvedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan open exception row: %w", err)
+		}
+		exc := &models.ReconciliationException{
+			ID:         id,
+			Type:       excType,
+			Severity:   severity,
+			EntityRef:  ref,
+			Expected:   json.RawMessage(expected),
+			Observed:   json.RawMessage(observed),
+			Status:     status,
+			DetectedAt: detectedAt.UTC(),
+		}
+		if resolvedAt.Valid {
+			t := resolvedAt.Time.UTC()
+			exc.ResolvedAt = &t
+		}
+		exceptions = append(exceptions, exc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading open exception rows: %w", err)
+	}
+	return exceptions, nil
 }

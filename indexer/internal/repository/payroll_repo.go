@@ -330,3 +330,74 @@ func (r *PayrollRepository) ListClaims(ctx context.Context, filter SalaryClaimFi
 
 	return claims, total, nil
 }
+
+// GetFundingsByBlockRange retrieves all payroll funding records within a block range [fromBlock, toBlock].
+func (r *PayrollRepository) GetFundingsByBlockRange(ctx context.Context, chainID int64, fromBlock, toBlock uint64) ([]*models.PayrollFunding, error) {
+	const query = `
+		SELECT
+			id,
+			employer,
+			employee,
+			amount_paid,
+			fee,
+			amount_credited,
+			tx_hash,
+			block_number,
+			block_timestamp,
+			log_index,
+			chain_id
+		FROM payroll_fundings
+		WHERE chain_id = $1 AND block_number >= $2 AND block_number <= $3
+		ORDER BY block_number ASC, log_index ASC, id ASC
+	`
+	rows, err := r.pool.Query(ctx, query, chainID, int64(fromBlock), int64(toBlock))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query payroll fundings by block range: %w", err)
+	}
+	defer rows.Close()
+
+	fundings := make([]*models.PayrollFunding, 0)
+	for rows.Next() {
+		var (
+			id                int64
+			employerStr       string
+			employeeStr       string
+			amountPaidStr     string
+			feeStr            string
+			amountCreditedStr string
+			txHashStr         string
+			blockNumber       int64
+			blockTimestamp    time.Time
+			logIndex          int
+			cid               int64
+		)
+
+		if err := rows.Scan(&id, &employerStr, &employeeStr, &amountPaidStr, &feeStr, &amountCreditedStr, &txHashStr, &blockNumber, &blockTimestamp, &logIndex, &cid); err != nil {
+			return nil, fmt.Errorf("failed to scan funding row: %w", err)
+		}
+
+		paid, _ := new(big.Int).SetString(amountPaidStr, 10)
+		fee, _ := new(big.Int).SetString(feeStr, 10)
+		credited, _ := new(big.Int).SetString(amountCreditedStr, 10)
+
+		fundings = append(fundings, &models.PayrollFunding{
+			ID:             id,
+			Employer:       common.HexToAddress(employerStr),
+			Employee:       common.HexToAddress(employeeStr),
+			AmountPaid:     paid,
+			Fee:            fee,
+			AmountCredited: credited,
+			TxHash:         common.HexToHash(txHashStr),
+			BlockNumber:    uint64(blockNumber),
+			BlockTimestamp: blockTimestamp.UTC(),
+			LogIndex:       uint(logIndex),
+			ChainID:        cid,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading funding rows: %w", err)
+	}
+
+	return fundings, nil
+}

@@ -516,6 +516,64 @@ curl -s http://localhost:8080/ready
 
 ---
 
+## Reconciliation Worker — Payroll Funding Safety Check
+
+The **Reconciliation Worker** acts as the safety check and audit layer for the WTF On-Chain Monitor. It compares authoritative on-chain state against observed/indexed PostgreSQL database data and creates structured, idempotent exceptions in `reconciliation_exceptions` whenever a mismatch is detected.
+
+> **Key Architectural Principle**: The reconciliation worker checks the indexer — it is not a second indexer. It does not silently insert missing rows; it surfaces discrepancies for operational visibility and auditability.
+
+### Domain Rule: Smart Contract Storage vs Authoritative Events
+The `MonthlyPayroll` smart contract (`0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC`) maintains running state mappings (`employers`, `employees`, `payrolls`), but **does not expose an iterable historical funding array or transaction ledger in contract storage**. Therefore, the authoritative source of truth for individual funding event transactions is the immutable `PayrollFunded` event emitted in transaction receipts on the blockchain. The reconciler decodes these authoritative on-chain logs and verifies them against the indexed `payroll_fundings` table in PostgreSQL.
+
+### Discrepancy Classification & Severities
+
+| Mismatch Type | Severity | Description |
+| :--- | :--- | :--- |
+| `PAYROLL_FUNDING_MISSING` | `high` | On-chain `PayrollFunded` event exists within finalized range and indexer checkpoint, but is absent from `payroll_fundings`. |
+| `PAYROLL_FUNDING_AMOUNT_MISMATCH` | `high` | Discrepancy in `amount_paid`, `fee`, or `amount_credited` between on-chain event and database record. |
+| `PAYROLL_FUNDING_ENTITY_MISMATCH` | `critical` | Employer or employee wallet address mismatch between on-chain event and database record. |
+| `PAYROLL_FUNDING_DUPLICATE` | `high` | Multiple database records exist for the same on-chain `(chain_id, tx_hash, log_index)`. |
+| `PAYROLL_FUNDING_TX_INCONSISTENCY` | `medium` | Block number or transaction metadata differs between blockchain log and database record. |
+
+### Lifecycle & Safety Features
+- **Distinguishing Indexing Lag vs Genuine Mismatches**: If an on-chain event is on a block higher than the indexer's checkpoint (`block > indexerCheckpoint`), it is classified as normal indexing lag, not an error, and is not flagged as missing.
+- **Reorganization Safety (Confirmation Depth)**: Any blocks above `safeTarget = latestBlock - confirmationDepth` are ignored as unfinalized.
+- **System Failure Isolation**: RPC timeouts or database connection drops return clean system errors and abort the run without generating false data mismatch exceptions.
+- **Idempotency**: Exception entity references follow a deterministic format (`chain_id:tx_hash:log_index:mismatch_type`). Repeated runs skip already open exceptions without creating duplicate rows.
+- **Automated Lifecycle Resolution**: When a subsequent reconciliation pass detects that a previously open mismatch has been resolved (e.g. after indexer backfill), it marks the exception `status = 'resolved'` and records `resolved_at`.
+
+### Running the Reconciliation Worker
+
+#### 1. Explicit Range Check
+```bash
+cd indexer
+go run ./cmd/reconciler -from-block 11080692 -to-block 11084000
+```
+Or via the indexer CLI:
+```bash
+go run ./cmd/indexer -reconcile -from-block 11080692 -to-block 11084000
+```
+
+#### 2. Recent Finalized Window Check
+```bash
+go run ./cmd/reconciler -window 500
+```
+
+#### 3. Continuous Reconciliation Daemon Loop
+```bash
+go run ./cmd/reconciler -loop -interval 30s
+```
+
+#### 4. Querying Exceptions via REST API
+```bash
+# View open high-severity exceptions
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?status=open&severity=high" | jq .
+
+# View all reconciliation exceptions
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?page=1&page_size=20" | jq .
+```
+
+
 ## REST API Reference
 
 ### Response Envelopes
@@ -947,11 +1005,14 @@ go test -v -count=1 ./...
 - [x] Operator authentication & backfill scheduling
 - [x] OpenAPI 3.0 specification ([`docs/openapi.yaml`](docs/openapi.yaml))
 
+- [x] Continuous synchronization live monitor daemon
+- [x] Automated Reconciliation Engine — Payroll Funding (`internal/reconciliation`)
+- [x] Automated detection, classification, and resolution in `reconciliation_exceptions`
+
 ### Next
-- [ ] Continuous synchronization worker daemon (automatic polling of newly confirmed blocks)
-- [ ] Automated Reconciliation Engine (comparing database ledger with on-chain contract state)
+- [ ] Salary Claim Reconciliation
+- [ ] ERC-20 Token Transfer & Balance Reconciliation
 - [ ] Reorganization detection and event rollback handling
-- [ ] Automated detection and persistence to `reconciliation_exceptions`
 
 ### Future
 - [ ] Next.js monitoring dashboard UI

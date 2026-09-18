@@ -257,3 +257,35 @@ func TestLoad_RPCRetryConfig(t *testing.T) {
 		t.Errorf("expected RPCBackoffFactor 2.5, got %f", cfg.RPCBackoffFactor)
 	}
 }
+
+func TestLoad_ReconciliationConfig(t *testing.T) {
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11080692")
+	t.Setenv("CONFIRMATIONS", "5")
+	t.Setenv("POLLING_INTERVAL", "5s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("RECONCILIATION_ENABLED", "true")
+	t.Setenv("RECONCILIATION_BLOCK_WINDOW", "1000")
+	t.Setenv("RECONCILIATION_INTERVAL", "15s")
+	t.Setenv("RECONCILIATION_STREAM_ID", "recon_test_stream")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	if !cfg.ReconciliationEnabled {
+		t.Errorf("expected ReconciliationEnabled true, got false")
+	}
+	if cfg.ReconciliationBlockWindow != 1000 {
+		t.Errorf("expected ReconciliationBlockWindow 1000, got %d", cfg.ReconciliationBlockWindow)
+	}
+	if cfg.ReconciliationInterval.Seconds() != 15 {
+		t.Errorf("expected ReconciliationInterval 15s, got %v", cfg.ReconciliationInterval)
+	}
+	if cfg.ReconciliationStreamID != "recon_test_stream" {
+		t.Errorf("expected ReconciliationStreamID 'recon_test_stream', got %q", cfg.ReconciliationStreamID)
+	}
+}

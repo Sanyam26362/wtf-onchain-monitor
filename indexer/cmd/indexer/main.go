@@ -20,6 +20,8 @@ import (
 	"worldtradefuture/indexer/internal/decoder"
 	"worldtradefuture/indexer/internal/indexer"
 	"worldtradefuture/indexer/internal/persistence"
+	"worldtradefuture/indexer/internal/reconciliation"
+	"worldtradefuture/indexer/internal/repository"
 )
 
 func main() {
@@ -30,9 +32,11 @@ func main() {
 	liveFlag := flag.Bool("live", false, "Run in continuous live monitoring mode")
 	pollIntervalFlag := flag.Duration("poll-interval", 0, "Override live polling interval (e.g. 5s)")
 	confirmationsFlag := flag.Uint64("confirmations", 0, "Override confirmation depth")
-	streamFlag := flag.String("stream", "all", "Stream to process ('payroll', 'token', or 'all')")
+	streamFlag := flag.String("stream", "all", "Stream to process ('payroll', 'token', 'all', or 'reconcile')")
 	maxRetriesFlag := flag.Int("max-retries", 0, "Override max RPC retries on transient/rate-limit error")
 	initialBackoffFlag := flag.Duration("initial-backoff", 0, "Override initial RPC retry backoff duration (e.g. 1s)")
+	reconcileFlag := flag.Bool("reconcile", false, "Run payroll funding reconciliation check")
+	reconWindowFlag := flag.Uint64("recon-window", 0, "Override reconciliation block window size (e.g. 500)")
 	flag.Parse()
 
 	// Initialize structured logger
@@ -244,6 +248,67 @@ func main() {
 	}
 	fmt.Printf("Backfill Target Block:   %d\n", targetBlock)
 
+	// Branch: Payroll Funding Reconciliation Check
+	if *reconcileFlag || *streamFlag == "reconcile" || *streamFlag == "reconciliation" {
+		fmt.Println("\n==================================================")
+		fmt.Println("Running Payroll Funding Reconciliation Check...")
+		fmt.Println("==================================================")
+
+		reconRepo := repository.NewReconciliationRepository(db.Pool())
+		payrollRepo := repository.NewPayrollRepository(db.Pool())
+		eventDecoder, err := decoder.New(common.HexToAddress(cfg.PayrollContractAddress))
+		if err != nil {
+			log.Fatalf("failed to initialize event decoder for reconciliation: %v", err)
+		}
+
+		reconCfg := reconciliation.PayrollReconcilerConfig{
+			ChainID:           cfg.ChainID,
+			ContractAddress:   common.HexToAddress(cfg.PayrollContractAddress),
+			PayrollStreamID:   cfg.PayrollStreamID,
+			ReconStreamID:     cfg.ReconciliationStreamID,
+			ConfirmationDepth: cfg.ConfirmationDepth,
+			BlockWindow:       cfg.ReconciliationBlockWindow,
+			StartBlock:        startBlock,
+		}
+
+		reconciler, err := reconciliation.NewPayrollReconciler(
+			reconCfg,
+			client,
+			eventDecoder,
+			payrollRepo,
+			reconRepo,
+			db,
+		)
+		if err != nil {
+			log.Fatalf("failed to initialize payroll reconciler: %v", err)
+		}
+		reconciler.SetRetryPolicy(indexer.RetryPolicy{
+			MaxRetries:     cfg.RPCMaxRetries,
+			InitialBackoff: cfg.RPCInitialBackoff,
+			MaxBackoff:     cfg.RPCMaxBackoff,
+			BackoffFactor:  cfg.RPCBackoffFactor,
+			Sleeper:        indexer.DefaultSleeper,
+		})
+
+		var res *reconciliation.ReconciliationResult
+		if *reconWindowFlag > 0 {
+			fmt.Printf("Reconciling recent window of %d blocks...\n", *reconWindowFlag)
+			res, err = reconciler.ReconcileRecentWindow(ctx, *reconWindowFlag)
+		} else {
+			fmt.Printf("Reconciling range %d -> %d...\n", startBlock, targetBlock)
+			res, err = reconciler.ReconcileRange(ctx, startBlock, targetBlock)
+		}
+		if err != nil {
+			log.Fatalf("reconciliation execution failed: %v", err)
+		}
+
+		printReconciliationSummary(res)
+		fmt.Println("==================================================")
+		fmt.Println("WTF Reconciliation run complete.")
+		fmt.Println("==================================================")
+		return
+	}
+
 	// 2. Historical Backfill: Index MonthlyPayroll if configured
 	if payrollService != nil {
 		payrollAddr := common.HexToAddress(cfg.PayrollContractAddress)
@@ -289,4 +354,20 @@ func main() {
 	fmt.Println("==================================================")
 	fmt.Println("WTF Indexer run complete.")
 	fmt.Println("==================================================")
+}
+
+func printReconciliationSummary(res *reconciliation.ReconciliationResult) {
+	if res == nil {
+		return
+	}
+	fmt.Printf("\n--- Reconciliation Summary ---\n")
+	fmt.Printf("Block Range Checked:     %d -> %d\n", res.FromBlock, res.ToBlock)
+	fmt.Printf("Safe Target Block:       %d\n", res.SafeTarget)
+	fmt.Printf("Indexer Checkpoint:      %d\n", res.IndexerCheckpoint)
+	fmt.Printf("On-Chain Events Found:   %d\n", res.OnChainEventsCount)
+	fmt.Printf("Database Records Found:  %d\n", res.DBRecordsCount)
+	fmt.Printf("Mismatches Detected:     %d\n", res.MismatchesDetected)
+	fmt.Printf("Exceptions Created:      %d\n", res.ExceptionsCreated)
+	fmt.Printf("Exceptions Resolved:     %d\n", res.ExceptionsResolved)
+	fmt.Printf("Exceptions Skipped:      %d (already open)\n", res.ExceptionsSkipped)
 }
