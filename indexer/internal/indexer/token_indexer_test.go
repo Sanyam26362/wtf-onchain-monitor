@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
@@ -79,6 +80,10 @@ func (m *mockBlockchainClient) BlockTimestamp(ctx context.Context, blockNumber u
 }
 
 func (m *mockBlockchainClient) Close() {}
+
+func (m *mockBlockchainClient) CallContract(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
+	return nil, nil
+}
 
 func getTestDB(t *testing.T) *persistence.Postgres {
 	dbURL := os.Getenv("DATABASE_URL")

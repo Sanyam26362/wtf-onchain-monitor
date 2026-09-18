@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math/big"
 	"strings"
@@ -460,5 +461,198 @@ func (r *PayrollRepository) GetClaimsByBlockRange(ctx context.Context, chainID i
 	}
 
 	return claims, nil
+}
+
+// ListEmployers returns all employers indexed for a given chainID.
+func (r *PayrollRepository) ListEmployers(ctx context.Context, chainID int64) ([]*models.Employer, error) {
+	const query = `
+		SELECT
+			wallet,
+			funds,
+			total_salary_per_second,
+			active,
+			deactivation_time,
+			added_at,
+			removed_at,
+			latest_tx_hash,
+			chain_id
+		FROM employers
+		WHERE chain_id = $1
+		ORDER BY wallet ASC
+	`
+	rows, err := r.pool.Query(ctx, query, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list employers: %w", err)
+	}
+	defer rows.Close()
+
+	var employers []*models.Employer
+	for rows.Next() {
+		var (
+			walletStr            string
+			fundsStr             string
+			totalSalaryPerSecStr string
+			active               bool
+			deactTime            sql.NullInt64
+			addedAt              sql.NullTime
+			removedAt            sql.NullTime
+			latestTxHashStr      sql.NullString
+			cid                  int64
+		)
+
+		if err := rows.Scan(
+			&walletStr,
+			&fundsStr,
+			&totalSalaryPerSecStr,
+			&active,
+			&deactTime,
+			&addedAt,
+			&removedAt,
+			&latestTxHashStr,
+			&cid,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan employer row: %w", err)
+		}
+
+		funds, _ := new(big.Int).SetString(fundsStr, 10)
+		totalSalary, _ := new(big.Int).SetString(totalSalaryPerSecStr, 10)
+
+		emp := &models.Employer{
+			Wallet:               common.HexToAddress(walletStr),
+			Funds:                funds,
+			TotalSalaryPerSecond: totalSalary,
+			Active:               active,
+			ChainID:              cid,
+		}
+		if deactTime.Valid {
+			emp.DeactivationTime = &deactTime.Int64
+		}
+		if addedAt.Valid {
+			t := addedAt.Time.UTC()
+			emp.AddedAt = &t
+		}
+		if removedAt.Valid {
+			t := removedAt.Time.UTC()
+			emp.RemovedAt = &t
+		}
+		if latestTxHashStr.Valid {
+			h := common.HexToHash(latestTxHashStr.String)
+			emp.LatestTxHash = &h
+		}
+
+		employers = append(employers, emp)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading employer rows: %w", err)
+	}
+
+	return employers, nil
+}
+
+// ListEmployees returns all employees indexed for a given chainID.
+func (r *PayrollRepository) ListEmployees(ctx context.Context, chainID int64) ([]*models.Employee, error) {
+	const query = `
+		SELECT
+			wallet,
+			employer,
+			salary_per_second,
+			last_withdraw,
+			active,
+			total_leaves,
+			deactivation_time,
+			allocation,
+			added_at,
+			removed_at,
+			latest_tx_hash,
+			chain_id
+		FROM employees
+		WHERE chain_id = $1
+		ORDER BY wallet ASC
+	`
+	rows, err := r.pool.Query(ctx, query, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list employees: %w", err)
+	}
+	defer rows.Close()
+
+	var employees []*models.Employee
+	for rows.Next() {
+		var (
+			walletStr          string
+			employerStr        string
+			salaryPerSecStr    string
+			lastWithdraw       sql.NullInt64
+			active             bool
+			totalLeavesStr     sql.NullString
+			deactTime          sql.NullInt64
+			allocationStr      sql.NullString
+			addedAt            sql.NullTime
+			removedAt          sql.NullTime
+			latestTxHashStr    sql.NullString
+			cid                int64
+		)
+
+		if err := rows.Scan(
+			&walletStr,
+			&employerStr,
+			&salaryPerSecStr,
+			&lastWithdraw,
+			&active,
+			&totalLeavesStr,
+			&deactTime,
+			&allocationStr,
+			&addedAt,
+			&removedAt,
+			&latestTxHashStr,
+			&cid,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan employee row: %w", err)
+		}
+
+		salary, _ := new(big.Int).SetString(salaryPerSecStr, 10)
+
+		emp := &models.Employee{
+			Wallet:          common.HexToAddress(walletStr),
+			Employer:        common.HexToAddress(employerStr),
+			SalaryPerSecond: salary,
+			Active:          active,
+			ChainID:         cid,
+		}
+		if lastWithdraw.Valid {
+			emp.LastWithdraw = &lastWithdraw.Int64
+		}
+		if totalLeavesStr.Valid {
+			tl, _ := new(big.Int).SetString(totalLeavesStr.String, 10)
+			emp.TotalLeaves = tl
+		}
+		if deactTime.Valid {
+			emp.DeactivationTime = &deactTime.Int64
+		}
+		if allocationStr.Valid {
+			al, _ := new(big.Int).SetString(allocationStr.String, 10)
+			emp.Allocation = al
+		}
+		if addedAt.Valid {
+			t := addedAt.Time.UTC()
+			emp.AddedAt = &t
+		}
+		if removedAt.Valid {
+			t := removedAt.Time.UTC()
+			emp.RemovedAt = &t
+		}
+		if latestTxHashStr.Valid {
+			h := common.HexToHash(latestTxHashStr.String)
+			emp.LatestTxHash = &h
+		}
+
+		employees = append(employees, emp)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading employee rows: %w", err)
+	}
+
+	return employees, nil
 }
 

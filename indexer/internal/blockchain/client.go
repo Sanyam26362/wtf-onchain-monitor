@@ -20,6 +20,7 @@ type BlockchainClient interface {
 	GetTokenLogs(ctx context.Context, tokenAddress common.Address, topic common.Hash, fromBlock uint64, toBlock uint64) ([]types.Log, error)
 	TransactionMetadata(ctx context.Context, txHash common.Hash) (*TransactionMetadata, error)
 	BlockTimestamp(ctx context.Context, blockNumber uint64) (uint64, error)
+	CallContract(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
 	Close()
 }
 
@@ -186,6 +187,28 @@ func (c *Client) BlockTimestamp(
 	}
 
 	return timestamp, nil
+}
+
+func (c *Client) CallContract(
+	ctx context.Context,
+	msg ethereum.CallMsg,
+	blockNumber *big.Int,
+) ([]byte, error) {
+	var result []byte
+	err := retry(ctx, 3, 300*time.Millisecond, func() error {
+		var qErr error
+		result, qErr = c.eth.CallContract(ctx, msg, blockNumber)
+		return qErr
+	})
+	if err != nil {
+		toAddr := "unknown"
+		if msg.To != nil {
+			toAddr = msg.To.Hex()
+		}
+		return nil, fmt.Errorf("failed to call contract %s: %w", toAddr, err)
+	}
+
+	return result, nil
 }
 
 func (c *Client) Close() {

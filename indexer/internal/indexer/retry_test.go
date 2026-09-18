@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
@@ -356,6 +358,10 @@ func (m *flakyPayrollClient) BlockTimestamp(ctx context.Context, blockNumber uin
 }
 
 func (m *flakyPayrollClient) Close() {}
+
+func (m *flakyPayrollClient) CallContract(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
+	return nil, nil
+}
 
 // TestRetry_SanitizeSecretsInErrors tests that API keys in URLs are never logged.
 func TestRetry_SanitizeSecretsInErrors(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
@@ -118,6 +119,10 @@ func (m *mockPayrollClient) BlockTimestamp(ctx context.Context, blockNumber uint
 }
 
 func (m *mockPayrollClient) Close() {}
+
+func (m *mockPayrollClient) CallContract(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
+	return nil, nil
+}
 
 // TestPayroll_MultipleHistoricalRangesAndPartialRange tests:
 // 1. Chunked historical backfill across multiple ranges

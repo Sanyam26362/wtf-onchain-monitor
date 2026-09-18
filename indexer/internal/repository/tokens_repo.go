@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 
@@ -270,4 +271,149 @@ func (r *TokensRepository) GetTransfersByBlockRange(ctx context.Context, chainID
 	}
 
 	return transfers, nil
+}
+
+// GetRelevantAddresses discovers all unique non-zero addresses involved in token transfers,
+// payroll fundings, and salary claims up to upToBlock, plus includes payrollContract.
+func (r *TokensRepository) GetRelevantAddresses(
+	ctx context.Context,
+	chainID int64,
+	token common.Address,
+	payrollContract common.Address,
+	upToBlock uint64,
+) ([]common.Address, error) {
+	const query = `
+		SELECT DISTINCT address FROM (
+			SELECT LOWER(from_address) AS address FROM token_transfers WHERE chain_id = $1 AND LOWER(token) = LOWER($2) AND block_number <= $3
+			UNION
+			SELECT LOWER(to_address) AS address FROM token_transfers WHERE chain_id = $1 AND LOWER(token) = LOWER($2) AND block_number <= $3
+			UNION
+			SELECT LOWER(employer) AS address FROM payroll_fundings WHERE chain_id = $1 AND block_number <= $3
+			UNION
+			SELECT LOWER(employee) AS address FROM payroll_fundings WHERE chain_id = $1 AND block_number <= $3
+			UNION
+			SELECT LOWER(employee) AS address FROM salary_claims WHERE chain_id = $1 AND block_number <= $3
+		) addr_sub
+		WHERE address != '0x0000000000000000000000000000000000000000'
+		ORDER BY address ASC
+	`
+	rows, err := r.pool.Query(ctx, query, chainID, token.Hex(), int64(upToBlock))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query relevant addresses: %w", err)
+	}
+	defer rows.Close()
+
+	seen := make(map[common.Address]bool)
+	var addrs []common.Address
+
+	for rows.Next() {
+		var addrStr string
+		if err := rows.Scan(&addrStr); err != nil {
+			return nil, fmt.Errorf("failed to scan relevant address: %w", err)
+		}
+		a := common.HexToAddress(addrStr)
+		if a != (common.Address{}) && !seen[a] {
+			seen[a] = true
+			addrs = append(addrs, a)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating relevant addresses: %w", err)
+	}
+
+	// Ensure payroll contract is included if provided and non-zero
+	zeroAddr := common.HexToAddress("0x0000000000000000000000000000000000000000")
+	if payrollContract != zeroAddr && payrollContract != (common.Address{}) && !seen[payrollContract] {
+		seen[payrollContract] = true
+		addrs = append(addrs, payrollContract)
+	}
+
+	// Deterministic sort by lowercase hex
+	sort.Slice(addrs, func(i, j int) bool {
+		return strings.ToLower(addrs[i].Hex()) < strings.ToLower(addrs[j].Hex())
+	})
+
+	return addrs, nil
+}
+
+// CalculateTokenBalance calculates the net balance (incoming - outgoing) for a specific address up to upToBlock.
+func (r *TokensRepository) CalculateTokenBalance(
+	ctx context.Context,
+	chainID int64,
+	token common.Address,
+	wallet common.Address,
+	upToBlock uint64,
+) (*big.Int, error) {
+	const query = `
+		SELECT 
+			COALESCE(
+				(SELECT SUM(amount) FROM token_transfers WHERE chain_id = $1 AND LOWER(token) = LOWER($2) AND LOWER(to_address) = LOWER($3) AND block_number <= $4 AND removed = false),
+				0
+			) - COALESCE(
+				(SELECT SUM(amount) FROM token_transfers WHERE chain_id = $1 AND LOWER(token) = LOWER($2) AND LOWER(from_address) = LOWER($3) AND block_number <= $4 AND removed = false),
+				0
+			) AS balance
+	`
+	var balStr string
+	err := r.pool.QueryRow(ctx, query, chainID, token.Hex(), wallet.Hex(), int64(upToBlock)).Scan(&balStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate token balance for %s: %w", wallet.Hex(), err)
+	}
+
+	bal, ok := new(big.Int).SetString(balStr, 10)
+	if !ok {
+		return nil, fmt.Errorf("failed to parse balance string %q for %s", balStr, wallet.Hex())
+	}
+
+	return bal, nil
+}
+
+// CalculateAllTokenBalances calculates net balances for all addresses with transfers up to upToBlock.
+func (r *TokensRepository) CalculateAllTokenBalances(
+	ctx context.Context,
+	chainID int64,
+	token common.Address,
+	upToBlock uint64,
+) (map[common.Address]*big.Int, error) {
+	const query = `
+		SELECT
+			addr,
+			COALESCE(SUM(incoming), 0) - COALESCE(SUM(outgoing), 0) AS balance
+		FROM (
+			SELECT LOWER(to_address) AS addr, amount AS incoming, 0::numeric AS outgoing
+			FROM token_transfers
+			WHERE chain_id = $1 AND LOWER(token) = LOWER($2) AND block_number <= $3 AND removed = false
+			UNION ALL
+			SELECT LOWER(from_address) AS addr, 0::numeric AS incoming, amount AS outgoing
+			FROM token_transfers
+			WHERE chain_id = $1 AND LOWER(token) = LOWER($2) AND block_number <= $3 AND removed = false
+		) movements
+		WHERE addr != '0x0000000000000000000000000000000000000000'
+		GROUP BY addr
+	`
+	rows, err := r.pool.Query(ctx, query, chainID, token.Hex(), int64(upToBlock))
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate all token balances: %w", err)
+	}
+	defer rows.Close()
+
+	balances := make(map[common.Address]*big.Int)
+	for rows.Next() {
+		var addrStr, balStr string
+		if err := rows.Scan(&addrStr, &balStr); err != nil {
+			return nil, fmt.Errorf("failed to scan balance row: %w", err)
+		}
+		bal, ok := new(big.Int).SetString(balStr, 10)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse balance string %q for %s", balStr, addrStr)
+		}
+		balances[common.HexToAddress(addrStr)] = bal
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading balance rows: %w", err)
+	}
+
+	return balances, nil
 }

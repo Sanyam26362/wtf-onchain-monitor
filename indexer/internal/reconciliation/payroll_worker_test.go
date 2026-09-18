@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
@@ -22,12 +23,26 @@ import (
 // --- Mocks for testing ---
 
 type mockBlockchainClient struct {
-	mu          sync.Mutex
-	latestBlock uint64
-	latestErr   error
-	logs        []types.Log
-	getLogsErr  error
-	getLogsCall int
+	mu               sync.Mutex
+	latestBlock      uint64
+	latestErr        error
+	logs             []types.Log
+	getLogsErr       error
+	getLogsCall      int
+	callContractFunc func(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
+	callContractErr  error
+}
+
+func (m *mockBlockchainClient) CallContract(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.callContractErr != nil {
+		return nil, m.callContractErr
+	}
+	if m.callContractFunc != nil {
+		return m.callContractFunc(ctx, msg, blockNumber)
+	}
+	return nil, nil
 }
 
 func (m *mockBlockchainClient) LatestBlock(ctx context.Context) (uint64, error) {

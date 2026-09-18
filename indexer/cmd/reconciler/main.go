@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
 
@@ -26,7 +27,7 @@ import (
 )
 
 func main() {
-	typeFlag := flag.String("type", "payroll", "Reconciliation type: 'payroll' (or 'payroll-funding'), 'salary-claims' (or 'salary-claim'), 'token-transfers' (or 'tokens'), or 'all'")
+	typeFlag := flag.String("type", "payroll", "Reconciliation type: 'payroll' (or 'payroll-funding'), 'salary-claims' (or 'salary-claim'), 'token-transfers' (or 'tokens'), 'balance' (or 'token-balance'), or 'all'")
 	fromBlockFlag := flag.Uint64("from-block", 0, "Start block for reconciliation range")
 	toBlockFlag := flag.Uint64("to-block", 0, "Target block for reconciliation range")
 	windowFlag := flag.Uint64("window", 0, "Reconcile recent block window (e.g. 500)")
@@ -48,10 +49,12 @@ func main() {
 		normType = "salary-claims"
 	case "token-transfers", "token-transfer", "tokens", "token":
 		normType = "token-transfers"
+	case "balance", "balances", "token-balance", "token-balances", "contract-balance":
+		normType = "balance"
 	case "all", "both":
 		normType = "all"
 	default:
-		log.Fatalf("unsupported reconciliation type %q: must be 'payroll', 'salary-claims', 'token-transfers', or 'all'", *typeFlag)
+		log.Fatalf("unsupported reconciliation type %q: must be 'payroll', 'salary-claims', 'token-transfers', 'balance', or 'all'", *typeFlag)
 	}
 
 	fmt.Println("==================================================")
@@ -67,11 +70,11 @@ func main() {
 		log.Fatalf("configuration error: %v", err)
 	}
 
-	if (normType == "payroll" || normType == "salary-claims" || normType == "all") && cfg.PayrollContractAddress == "" {
-		log.Fatalf("PAYROLL_CONTRACT_ADDRESS is required for payroll reconciliation")
+	if (normType == "payroll" || normType == "salary-claims" || normType == "balance" || normType == "all") && cfg.PayrollContractAddress == "" {
+		log.Fatalf("PAYROLL_CONTRACT_ADDRESS is required for payroll/balance reconciliation")
 	}
-	if (normType == "token-transfers" || normType == "all") && cfg.TokenAddress == "" {
-		log.Fatalf("TOKEN_ADDRESS is required for token transfer reconciliation")
+	if (normType == "token-transfers" || normType == "balance" || normType == "all") && cfg.TokenAddress == "" {
+		log.Fatalf("TOKEN_ADDRESS is required for token transfer/balance reconciliation")
 	}
 
 	interval := cfg.ReconciliationInterval
@@ -207,8 +210,48 @@ func main() {
 		tokenReconciler.SetRetryPolicy(retryPolicy)
 	}
 
+	var balanceReconciler *reconciliation.BalanceReconciler
+	if normType == "balance" || normType == "all" {
+		if err := cfg.ValidateTokenConfig(); err != nil {
+			log.Fatalf("invalid token configuration for balance reconciliation: %v", err)
+		}
+
+		tokenAddr := common.HexToAddress(cfg.TokenAddress)
+		payrollAddr := common.HexToAddress(cfg.PayrollContractAddress)
+
+		payrollABI, pErr := abi.JSON(strings.NewReader(indexerABI.MainABI))
+		if pErr != nil {
+			log.Fatalf("failed to parse payroll ABI for balance reconciler: %v", pErr)
+		}
+
+		balanceReconCfg := reconciliation.BalanceReconcilerConfig{
+			ChainID:                cfg.ChainID,
+			TokenAddress:           tokenAddr,
+			PayrollContractAddress: payrollAddr,
+			TokenStreamID:          cfg.TokenStreamID,
+			ReconStreamID:          cfg.ReconciliationTokenBalanceStreamID,
+			ConfirmationDepth:      cfg.ConfirmationDepth,
+			StartBlock:             cfg.TokenStartBlock,
+		}
+
+		balanceReconciler, err = reconciliation.NewBalanceReconciler(
+			balanceReconCfg,
+			client,
+			cfg.ParsedTokenABI,
+			&payrollABI,
+			tokensRepo,
+			payrollRepo,
+			reconRepo,
+			db,
+		)
+		if err != nil {
+			log.Fatalf("failed to initialize balance reconciler: %v", err)
+		}
+		balanceReconciler.SetRetryPolicy(retryPolicy)
+	}
+
 	fmt.Printf("Chain ID:                %d\n", cfg.ChainID)
-	if cfg.PayrollContractAddress != "" && (payrollReconciler != nil || salaryClaimReconciler != nil) {
+	if cfg.PayrollContractAddress != "" && (payrollReconciler != nil || salaryClaimReconciler != nil || balanceReconciler != nil) {
 		fmt.Printf("Payroll Contract:        %s\n", cfg.PayrollContractAddress)
 	}
 	if payrollReconciler != nil {
@@ -220,6 +263,9 @@ func main() {
 	if tokenReconciler != nil {
 		fmt.Printf("Token Contract:          %s\n", cfg.TokenAddress)
 		fmt.Printf("Token Recon Stream ID:   %s\n", cfg.ReconciliationTokenStreamID)
+	}
+	if balanceReconciler != nil {
+		fmt.Printf("Balance Recon Stream ID: %s\n", cfg.ReconciliationTokenBalanceStreamID)
 	}
 	fmt.Printf("Confirmation Depth:      %d\n", cfg.ConfirmationDepth)
 	if *loopFlag {
@@ -302,6 +348,29 @@ func main() {
 
 			printSummary("WTF Token Transfer Reconciliation", res)
 		}
+
+		if balanceReconciler != nil {
+			var res *reconciliation.BalanceReconciliationResult
+			var bErr error
+
+			if *toBlockFlag > 0 {
+				res, bErr = balanceReconciler.ReconcileTargetBlock(ctx, *toBlockFlag)
+			} else if *windowFlag > 0 {
+				res, bErr = balanceReconciler.ReconcileRecentWindow(ctx, *windowFlag)
+			} else {
+				batchSize := cfg.BlockBatchSize
+				if *batchSizeFlag > 0 {
+					batchSize = *batchSizeFlag
+				}
+				res, bErr = balanceReconciler.ReconcileNextBatch(ctx, batchSize)
+			}
+
+			if bErr != nil {
+				return fmt.Errorf("contract and token balance reconciliation failed: %w", bErr)
+			}
+
+			printBalanceSummary("Contract & Token Balance Reconciliation", res)
+		}
 		return nil
 	}
 
@@ -345,6 +414,25 @@ func printSummary(title string, res *reconciliation.ReconciliationResult) {
 	fmt.Printf("Indexer Checkpoint:      %d\n", res.IndexerCheckpoint)
 	fmt.Printf("On-Chain Events Found:   %d\n", res.OnChainEventsCount)
 	fmt.Printf("Database Records Found:  %d\n", res.DBRecordsCount)
+	fmt.Printf("Mismatches Detected:     %d\n", res.MismatchesDetected)
+	fmt.Printf("Exceptions Created:      %d\n", res.ExceptionsCreated)
+	fmt.Printf("Exceptions Resolved:     %d\n", res.ExceptionsResolved)
+	fmt.Printf("Exceptions Skipped:      %d (already open)\n", res.ExceptionsSkipped)
+}
+
+func printBalanceSummary(title string, res *reconciliation.BalanceReconciliationResult) {
+	if res == nil {
+		return
+	}
+	fmt.Printf("\n--- %s Summary ---\n", title)
+	fmt.Printf("Target Block Checked:    %d\n", res.TargetBlock)
+	fmt.Printf("Safe Target Block:       %d\n", res.SafeTarget)
+	fmt.Printf("Indexer Checkpoint:      %d\n", res.IndexerCheckpoint)
+	fmt.Printf("Addresses Audited:       %d\n", res.AddressesCheckedCount)
+	fmt.Printf("Balances Matching:       %d\n", res.BalancesMatchedCount)
+	fmt.Printf("Contract Balances:       %d\n", res.ContractBalancesCount)
+	fmt.Printf("States Audited:          %d\n", res.StatesCheckedCount)
+	fmt.Printf("States Matching:         %d\n", res.StatesMatchedCount)
 	fmt.Printf("Mismatches Detected:     %d\n", res.MismatchesDetected)
 	fmt.Printf("Exceptions Created:      %d\n", res.ExceptionsCreated)
 	fmt.Printf("Exceptions Resolved:     %d\n", res.ExceptionsResolved)

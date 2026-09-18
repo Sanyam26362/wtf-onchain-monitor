@@ -35,7 +35,7 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 - [x] API validation/pagination (Address format, tx hash, bounded pagination, whitelisted sorting)
 - [x] Continuous live monitoring (Background daemon for real-time finalized block synchronization)
 - [x] Reconciliation engine — Payroll Funding, Salary Claim & ERC-20 Transfer verification (`reconciliation_exceptions`)
-- [ ] Reconciliation engine — Contract & Token Balance verification
+- [x] Reconciliation engine — Contract & Token Balance verification
 - [ ] Dashboard/product integration (Next.js frontend user interface)
 
 | Feature / Milestone | Status | Description |
@@ -53,6 +53,7 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 | **Payroll Funding Reconciler**| Completed | Independent audit comparing on-chain `PayrollFunded` events to database records |
 | **Salary Claim Reconciler** | Completed | Independent audit comparing on-chain `SalaryClaimed` events to database records |
 | **Token Transfer Reconciler** | Completed | Independent audit comparing on-chain ERC-20 `Transfer` events to database records |
+| **Contract & Balance Reconciler** | Completed | Independent audit comparing on-chain ERC-20 `balanceOf` and contract state to DB balances |
 | **Dashboard UI** | Future | Next.js monitoring dashboard integration |
 
 ---
@@ -567,25 +568,46 @@ The reconciler decodes these authoritative on-chain logs and verifies them again
 | `TOKEN_TRANSFER_DUPLICATE` | `high` | Multiple database records exist for the same on-chain `(chain_id, token, tx_hash, log_index)`. |
 | `TOKEN_TRANSFER_TX_INCONSISTENCY` | `medium` | Block number or transaction metadata differs between blockchain log and database record. |
 
+#### 4. Contract & Token Balance Discrepancies
+| Mismatch Type | Severity | Description |
+| :--- | :--- | :--- |
+| `TOKEN_BALANCE_MISMATCH` | `high` | Discrepancy between on-chain `balanceOf(wallet)` at `targetBlock` and PostgreSQL balance derived from `token_transfers` ($\sum(\text{incoming}) - \sum(\text{outgoing})$) up to `targetBlock`. |
+| `CONTRACT_BALANCE_MISMATCH` | `high` | Discrepancy between on-chain ERC-20 token balance of the `MonthlyPayroll` contract address and the database-derived token balance for `MonthlyPayroll`. |
+| `CONTRACT_STATE_MISMATCH` | `medium` | Discrepancy between on-chain `MonthlyPayroll` active status methods (`isEmployerActive`, `isEmployeeActive`) and PostgreSQL status (`employers.active`, `employees.active`). |
+
 ### Lifecycle & Safety Features
-- **Distinguishing Indexing Lag vs Genuine Mismatches**: If an on-chain event is on a block higher than the indexer's checkpoint (`block > indexerCheckpoint`), it is classified as normal indexing lag, not an error, and is not flagged as missing.
-- **Token Address Isolation**: The token reconciler verifies events strictly from the configured `TOKEN_ADDRESS` (ignoring any other ERC-20 contracts on-chain).
-- **Exact Numeric Representation**: All token and payroll amounts are compared as exact unsigned multi-precision integers (`*big.Int`), completely avoiding floating-point rounding errors.
+- **Distinguishing Indexing Lag vs Genuine Mismatches**: In balance reconciliation, evaluation is locked strictly to `effectiveTarget = min(safeTarget, indexerCheckpoint)`. Both the on-chain `eth_call` (with block number tag) and the database transfer sum evaluate at the EXACT same block height. Blocks ahead of the indexer cursor are never queried, completely eliminating false positives caused by indexing lag.
+- **Token Address Isolation**: The token and balance reconcilers audit balances and events strictly for the configured `TOKEN_ADDRESS`.
+- **Exact Numeric Representation**: All token balances and transfer amounts are computed using exact unsigned multi-precision integers (`*big.Int` and PostgreSQL `numeric(78,0)` integer math), completely avoiding floating-point rounding errors.
 - **Reorganization Safety (Confirmation Depth)**: Any blocks above `safeTarget = latestBlock - confirmationDepth` are ignored as unfinalized.
-- **System Failure Isolation**: RPC timeouts or database connection drops return clean system errors and abort the run without generating false data mismatch exceptions.
+- **Deterministic Address Discovery**: The balance reconciler automatically aggregates all unique participating wallet addresses from `token_transfers` (`from_address`, `to_address`), `payroll_fundings` (`employer`, `employee`), `salary_claims` (`employee`), and the `MonthlyPayroll` contract address. The Ethereum zero address (`0x00...00`) is excluded from normal user balance assertions.
+- **System Failure Isolation**: RPC timeouts, 429 rate limits, or database connection drops return clean system errors and abort the run without generating false data mismatch exceptions.
 - **Durable Checkpoint Isolation**:
   - `reconciliation_payroll_funding`: Checkpoint cursor for payroll funding reconciliation.
   - `reconciliation_salary_claim`: Checkpoint cursor for salary claim reconciliation.
   - `reconciliation_erc20_transfers_<token_address>`: Isolated checkpoint cursor per token contract address.
-- **Idempotency**: Exception entity references follow a deterministic format (`{chain_id}:{token_address}:{tx_hash}:{log_index}:{mismatch_type}` for tokens, `{chain_id}:{tx_hash}:{log_index}:{mismatch_type}` for payroll). Repeated runs skip already open exceptions without creating duplicate rows.
-- **Automated Lifecycle Resolution**: When a subsequent reconciliation pass detects that a previously open mismatch has been resolved (e.g. after indexer backfill or fix), it marks the exception `status = 'resolved'` and records `resolved_at`.
+  - `reconciliation_token_balance_<token_address>`: Dedicated checkpoint cursor for contract and token balance reconciliation.
+- **Idempotency**: Exception entity references follow deterministic formats (e.g. `{chain_id}:{token_address}:{wallet}:token_balance_mismatch`). Repeated runs skip already open exceptions without creating duplicate rows.
+- **Automated Lifecycle Resolution**: When a subsequent reconciliation pass detects that a previously open balance mismatch has resolved (e.g. after indexer backfill), it automatically transitions the exception status to `resolved` and records `resolved_at`.
 
 ### Running the Reconciliation Worker
 
-#### 1. WTF ERC-20 Token Transfer Reconciliation
+#### 1. Contract & Token Balance Reconciliation
 ```bash
 cd indexer
 
+# Reconcile contract & token balances at an explicit target block
+go run ./cmd/reconciler -type balance -to-block 11724713
+
+# Reconcile recent finalized window
+go run ./cmd/reconciler -type balance -window 500
+
+# Sequential sweep / continuous balance reconciliation daemon
+go run ./cmd/reconciler -type balance -loop -interval 30s
+```
+
+#### 2. WTF ERC-20 Token Transfer Reconciliation
+```bash
 # Reconcile an explicit block range
 go run ./cmd/reconciler -type token-transfers -from-block 11717931 -to-block 11720000
 
@@ -596,7 +618,7 @@ go run ./cmd/reconciler -type token-transfers -window 500
 go run ./cmd/reconciler -type token-transfers -loop -interval 30s
 ```
 
-#### 2. Salary Claim Reconciliation
+#### 3. Salary Claim Reconciliation
 ```bash
 # Reconcile an explicit block range
 go run ./cmd/reconciler -type salary-claims -from-block 11080692 -to-block 11084000
@@ -608,7 +630,7 @@ go run ./cmd/reconciler -type salary-claims -window 500
 go run ./cmd/reconciler -type salary-claims -loop -interval 30s
 ```
 
-#### 3. Payroll Funding Reconciliation
+#### 4. Payroll Funding Reconciliation
 ```bash
 # Explicit range
 go run ./cmd/reconciler -type payroll -from-block 11080692 -to-block 11084000
@@ -617,17 +639,20 @@ go run ./cmd/reconciler -type payroll -from-block 11080692 -to-block 11084000
 go run ./cmd/reconciler -from-block 11080692 -to-block 11084000
 ```
 
-#### 4. Multi-Stream / All Reconciliation Checks
+#### 5. Multi-Stream / All Reconciliation Checks
 ```bash
-# Run Payroll Funding, Salary Claim, and Token Transfer checks
-go run ./cmd/reconciler -type all -from-block 11717931 -to-block 11720000
+# Run Payroll Funding, Salary Claim, Token Transfer, and Balance checks together
+go run ./cmd/reconciler -type all -to-block 11724713
 
 # Continuous multi-check daemon
 go run ./cmd/reconciler -type all -loop -interval 30s
 ```
 
-#### 5. Running via Indexer CLI
+#### 6. Running via Indexer CLI
 ```bash
+# Reconcile contract & token balances
+go run ./cmd/indexer -reconcile -recon-type balance -to-block 11724713
+
 # Reconcile token transfers
 go run ./cmd/indexer -reconcile -recon-type token-transfers -from-block 11717931 -to-block 11720000
 
@@ -638,10 +663,19 @@ go run ./cmd/indexer -reconcile -recon-type salary-claims -from-block 11080692 -
 go run ./cmd/indexer -reconcile -recon-type all
 ```
 
-#### 6. Querying Exceptions via REST API
+#### 7. Querying Exceptions via REST API
 ```bash
 # View open high-severity exceptions
 curl -s "http://localhost:8080/v1/reconciliation/exceptions?status=open&severity=high" | jq .
+
+# Filter specifically for token balance discrepancies
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?type=TOKEN_BALANCE_MISMATCH" | jq .
+
+# Filter specifically for contract balance discrepancies
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?type=CONTRACT_BALANCE_MISMATCH" | jq .
+
+# Filter specifically for contract state discrepancies
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?type=CONTRACT_STATE_MISMATCH" | jq .
 
 # Filter specifically for token transfer discrepancies
 curl -s "http://localhost:8080/v1/reconciliation/exceptions?type=TOKEN_TRANSFER_MISSING" | jq .
@@ -1092,10 +1126,10 @@ go test -v -count=1 ./...
 - [x] Automated Reconciliation Engine — Payroll Funding (`internal/reconciliation`)
 - [x] Automated Reconciliation Engine — Salary Claims (`internal/reconciliation`)
 - [x] Automated Reconciliation Engine — WTF ERC-20 Token Transfers (`internal/reconciliation`)
+- [x] Automated Reconciliation Engine — Contract & Token Balances (`internal/reconciliation`)
 - [x] Automated detection, classification, and resolution in `reconciliation_exceptions`
 
 ### Next
-- [ ] Contract & Token Balance Reconciliation
 - [ ] Reorganization detection and event rollback handling
 
 ### Future
