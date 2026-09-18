@@ -202,7 +202,7 @@ func (m *LiveMonitor) PollPayroll(ctx context.Context, safeTarget uint64) (int, 
 			"to_block", to,
 		)
 
-		events, err := m.payrollService.IndexRange(ctx, m.cfg.ChainID, m.cfg.PayrollContractAddress, from, to)
+		events, err := m.payrollService.IndexRangeWithRetry(ctx, m.cfg.ChainID, m.cfg.PayrollContractAddress, from, to, m.cfg.PayrollStreamID)
 		if err != nil {
 			slog.Error("failed to process payroll block range",
 				"stream", m.cfg.PayrollStreamID,
@@ -273,7 +273,7 @@ func (m *LiveMonitor) PollToken(ctx context.Context, safeTarget uint64) (int, er
 		)
 
 		// IndexRange executes batch persistence and checkpoint update atomically
-		transfers, err := m.tokenIndexer.IndexRange(ctx, from, to)
+		transfers, err := m.tokenIndexer.IndexRangeWithRetry(ctx, from, to)
 		if err != nil {
 			slog.Error("failed to process token block range",
 				"stream", m.cfg.TokenStreamID,

@@ -225,3 +225,35 @@ func TestLoad_LiveMonitoringConfig(t *testing.T) {
 		t.Errorf("expected LivePollInterval 3s, got %v", cfg.LivePollInterval)
 	}
 }
+
+func TestLoad_RPCRetryConfig(t *testing.T) {
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11080692")
+	t.Setenv("CONFIRMATIONS", "5")
+	t.Setenv("POLLING_INTERVAL", "5s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("RPC_MAX_RETRIES", "7")
+	t.Setenv("RPC_INITIAL_BACKOFF", "2s")
+	t.Setenv("RPC_MAX_BACKOFF", "45s")
+	t.Setenv("RPC_BACKOFF_FACTOR", "2.5")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	if cfg.RPCMaxRetries != 7 {
+		t.Errorf("expected RPCMaxRetries 7, got %d", cfg.RPCMaxRetries)
+	}
+	if cfg.RPCInitialBackoff.Seconds() != 2 {
+		t.Errorf("expected RPCInitialBackoff 2s, got %v", cfg.RPCInitialBackoff)
+	}
+	if cfg.RPCMaxBackoff.Seconds() != 45 {
+		t.Errorf("expected RPCMaxBackoff 45s, got %v", cfg.RPCMaxBackoff)
+	}
+	if cfg.RPCBackoffFactor != 2.5 {
+		t.Errorf("expected RPCBackoffFactor 2.5, got %f", cfg.RPCBackoffFactor)
+	}
+}

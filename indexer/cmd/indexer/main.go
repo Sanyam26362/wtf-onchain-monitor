@@ -31,6 +31,8 @@ func main() {
 	pollIntervalFlag := flag.Duration("poll-interval", 0, "Override live polling interval (e.g. 5s)")
 	confirmationsFlag := flag.Uint64("confirmations", 0, "Override confirmation depth")
 	streamFlag := flag.String("stream", "all", "Stream to process ('payroll', 'token', or 'all')")
+	maxRetriesFlag := flag.Int("max-retries", 0, "Override max RPC retries on transient/rate-limit error")
+	initialBackoffFlag := flag.Duration("initial-backoff", 0, "Override initial RPC retry backoff duration (e.g. 1s)")
 	flag.Parse()
 
 	// Initialize structured logger
@@ -70,11 +72,21 @@ func main() {
 		cfg.LivePollInterval = *pollIntervalFlag
 	}
 
+	if *maxRetriesFlag > 0 {
+		cfg.RPCMaxRetries = *maxRetriesFlag
+	}
+
+	if *initialBackoffFlag > 0 {
+		cfg.RPCInitialBackoff = *initialBackoffFlag
+	}
+
 	isLiveMode := *liveFlag || cfg.LiveMonitorEnabled
 
 	fmt.Printf("Chain ID:                %d\n", cfg.ChainID)
 	fmt.Printf("Confirmation Depth:      %d\n", cfg.ConfirmationDepth)
 	fmt.Printf("Block Batch Size:        %d\n", batchSize)
+	fmt.Printf("RPC Max Retries:         %d\n", cfg.RPCMaxRetries)
+	fmt.Printf("RPC Initial Backoff:     %s\n", cfg.RPCInitialBackoff)
 	if isLiveMode {
 		fmt.Printf("Mode:                    LIVE MONITORING\n")
 		fmt.Printf("Polling Interval:        %s\n", cfg.LivePollInterval)
@@ -135,6 +147,13 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to initialize MonthlyPayroll indexer: %v", err)
 		}
+		payrollService.SetRetryPolicy(indexer.RetryPolicy{
+			MaxRetries:     cfg.RPCMaxRetries,
+			InitialBackoff: cfg.RPCInitialBackoff,
+			MaxBackoff:     cfg.RPCMaxBackoff,
+			BackoffFactor:  cfg.RPCBackoffFactor,
+			Sleeper:        indexer.DefaultSleeper,
+		})
 	}
 
 	// Initialize Generic ERC-20 Token indexer if configured
@@ -168,6 +187,13 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to create token indexer: %v", err)
 		}
+		tokenIndexer.SetRetryPolicy(indexer.RetryPolicy{
+			MaxRetries:     cfg.RPCMaxRetries,
+			InitialBackoff: cfg.RPCInitialBackoff,
+			MaxBackoff:     cfg.RPCMaxBackoff,
+			BackoffFactor:  cfg.RPCBackoffFactor,
+			Sleeper:        indexer.DefaultSleeper,
+		})
 	}
 
 	// Branch: Continuous Live Monitoring vs Historical Backfill

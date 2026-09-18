@@ -40,6 +40,12 @@ type Config struct {
 	ExplorerTxURLTemplate string
 	OperatorAPIKey        string
 
+	// RPC Retry Configuration
+	RPCMaxRetries     int
+	RPCInitialBackoff time.Duration
+	RPCMaxBackoff     time.Duration
+	RPCBackoffFactor  float64
+
 	// ParsedTokenABI is populated and cached after successful validation.
 	ParsedTokenABI *abi.ABI
 }
@@ -175,6 +181,47 @@ func Load() (Config, error) {
 	explorerTemplate := os.Getenv("EXPLORER_TX_URL_TEMPLATE")
 	operatorKey := os.Getenv("OPERATOR_API_KEY")
 
+	// RPC retry parameters
+	rpcMaxRetries := 5
+	if val := os.Getenv("RPC_MAX_RETRIES"); val != "" {
+		if r, err := strconv.Atoi(val); err == nil && r > 0 {
+			rpcMaxRetries = r
+		}
+	} else if val := os.Getenv("MAX_RETRIES"); val != "" {
+		if r, err := strconv.Atoi(val); err == nil && r > 0 {
+			rpcMaxRetries = r
+		}
+	}
+
+	rpcInitialBackoff := 1 * time.Second
+	if val := os.Getenv("RPC_INITIAL_BACKOFF"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			rpcInitialBackoff = d
+		}
+	} else if val := os.Getenv("INITIAL_BACKOFF"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			rpcInitialBackoff = d
+		}
+	}
+
+	rpcMaxBackoff := 30 * time.Second
+	if val := os.Getenv("RPC_MAX_BACKOFF"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			rpcMaxBackoff = d
+		}
+	} else if val := os.Getenv("MAX_BACKOFF"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			rpcMaxBackoff = d
+		}
+	}
+
+	rpcBackoffFactor := 2.0
+	if val := os.Getenv("RPC_BACKOFF_FACTOR"); val != "" {
+		if f, err := strconv.ParseFloat(val, 64); err == nil && f > 1.0 {
+			rpcBackoffFactor = f
+		}
+	}
+
 	cfg := Config{
 		ChainID:                chainID,
 		RPCURL:                 rpcURL,
@@ -199,6 +246,10 @@ func Load() (Config, error) {
 		CORSAllowedOrigins:     corsOrigins,
 		ExplorerTxURLTemplate:  explorerTemplate,
 		OperatorAPIKey:         operatorKey,
+		RPCMaxRetries:          rpcMaxRetries,
+		RPCInitialBackoff:      rpcInitialBackoff,
+		RPCMaxBackoff:          rpcMaxBackoff,
+		RPCBackoffFactor:       rpcBackoffFactor,
 	}
 
 	return cfg, nil

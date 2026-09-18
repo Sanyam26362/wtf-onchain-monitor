@@ -26,6 +26,7 @@ type Service struct {
 	client      blockchain.BlockchainClient
 	decoder     *decoder.Decoder
 	persistence PayrollPersistence
+	retryer     *Retryer
 }
 
 // BackfillOptions specifies parameters for running a historical backfill.
@@ -61,6 +62,7 @@ func New(
 		client:      client,
 		decoder:     eventDecoder,
 		persistence: db,
+		retryer:     NewRetryer(DefaultRetryPolicy()),
 	}, nil
 }
 
@@ -84,7 +86,18 @@ func NewWithDecoder(
 		client:      client,
 		decoder:     eventDecoder,
 		persistence: db,
+		retryer:     NewRetryer(DefaultRetryPolicy()),
 	}, nil
+}
+
+// SetRetryPolicy updates the service's RPC retry policy.
+func (s *Service) SetRetryPolicy(policy RetryPolicy) {
+	s.retryer = NewRetryer(policy)
+}
+
+// Retryer returns the configured retryer.
+func (s *Service) Retryer() *Retryer {
+	return s.retryer
 }
 
 // GetEffectiveStartBlock resolves the block number to start or resume from.
@@ -162,7 +175,7 @@ func (s *Service) RunBackfill(ctx context.Context, opts BackfillOptions) (uint64
 			"to", to,
 		)
 
-		events, err := s.IndexRange(ctx, opts.ChainID, opts.ContractAddress, from, to)
+		events, err := s.IndexRangeWithRetry(ctx, opts.ChainID, opts.ContractAddress, from, to, opts.StreamID)
 		if err != nil {
 			slog.Error("Failed to process block range",
 				"from", from,
@@ -197,6 +210,27 @@ func (s *Service) RunBackfill(ctx context.Context, opts BackfillOptions) (uint64
 	)
 
 	return lastIndexedBlock, nil
+}
+
+// IndexRangeWithRetry wraps IndexRange with retry logic for transient RPC and rate-limit errors.
+func (s *Service) IndexRangeWithRetry(
+	ctx context.Context,
+	chainID int64,
+	contractAddress common.Address,
+	fromBlock uint64,
+	toBlock uint64,
+	streamID string,
+) ([]*decoder.DecodedEvent, error) {
+	var events []*decoder.DecodedEvent
+	err := s.retryer.RetryRange(ctx, streamID, fromBlock, toBlock, func() error {
+		var indexErr error
+		events, indexErr = s.IndexRange(ctx, chainID, contractAddress, fromBlock, toBlock)
+		return indexErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
 // IndexRange fetches, decodes, persists, and projects events within [fromBlock, toBlock].

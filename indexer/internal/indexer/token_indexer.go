@@ -27,6 +27,7 @@ type TokenIndexer struct {
 	startBlock        uint64
 	batchSize         uint64
 	confirmationDepth uint64
+	retryer           *Retryer
 }
 
 // NewTokenIndexer creates a new generic ERC-20 token indexer.
@@ -66,7 +67,18 @@ func NewTokenIndexer(
 		startBlock:        startBlock,
 		batchSize:         batchSize,
 		confirmationDepth: confirmationDepth,
+		retryer:           NewRetryer(DefaultRetryPolicy()),
 	}, nil
+}
+
+// SetRetryPolicy updates the token indexer's RPC retry policy.
+func (ti *TokenIndexer) SetRetryPolicy(policy RetryPolicy) {
+	ti.retryer = NewRetryer(policy)
+}
+
+// Retryer returns the configured retryer.
+func (ti *TokenIndexer) Retryer() *Retryer {
+	return ti.retryer
 }
 
 // TokenAddress returns the configured token address.
@@ -349,6 +361,24 @@ func (ti *TokenIndexer) IndexRange(
 	return transfers, nil
 }
 
+// IndexRangeWithRetry wraps IndexRange with retry logic for transient RPC and rate-limit errors.
+func (ti *TokenIndexer) IndexRangeWithRetry(
+	ctx context.Context,
+	fromBlock uint64,
+	toBlock uint64,
+) ([]*models.TokenTransfer, error) {
+	var transfers []*models.TokenTransfer
+	err := ti.retryer.RetryRange(ctx, ti.streamID, fromBlock, toBlock, func() error {
+		var indexErr error
+		transfers, indexErr = ti.IndexRange(ctx, fromBlock, toBlock)
+		return indexErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return transfers, nil
+}
+
 // ProcessNextBatch determines the next bounded chunk and indexes it.
 // It respects confirmation depth and advances checkpoints only upon success.
 func (ti *TokenIndexer) ProcessNextBatch(ctx context.Context) (bool, uint64, uint64, int, error) {
@@ -382,7 +412,7 @@ func (ti *TokenIndexer) ProcessNextBatch(ctx context.Context) (bool, uint64, uin
 		toBlock = safeBlock
 	}
 
-	transfers, err := ti.IndexRange(ctx, fromBlock, toBlock)
+	transfers, err := ti.IndexRangeWithRetry(ctx, fromBlock, toBlock)
 	if err != nil {
 		return false, fromBlock, toBlock, 0, err
 	}
@@ -445,7 +475,7 @@ func (ti *TokenIndexer) RunBackfill(ctx context.Context, targetBlock uint64) (ui
 			"to", to,
 		)
 
-		transfers, err := ti.IndexRange(ctx, from, to)
+		transfers, err := ti.IndexRangeWithRetry(ctx, from, to)
 		if err != nil {
 			slog.Error("Failed to index token block range",
 				"stream_id", ti.streamID,
