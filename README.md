@@ -15,12 +15,13 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 5. [Generic ERC-20 Token Indexing](#generic-erc-20-token-indexing)
 6. [Quick Start & Running Services](#quick-start--running-services)
 7. [Continuous Live Monitoring](#continuous-live-monitoring)
-8. [REST API Reference](#rest-api-reference)
-9. [API Testing with Postman & cURL](#api-testing-with-postman--curl)
-10. [Automated Testing](#automated-testing)
-11. [Security Notes](#security-notes)
-12. [Troubleshooting](#troubleshooting)
-13. [Roadmap](#roadmap)
+8. [Reconciliation Worker (Safety Checks)](#reconciliation-worker--payroll-funding-salary-claim--token-transfer-safety-checks)
+9. [REST API Reference](#rest-api-reference)
+10. [API Testing with Postman & cURL](#api-testing-with-postman--curl)
+11. [Automated Testing](#automated-testing)
+12. [Security Notes](#security-notes)
+13. [Troubleshooting](#troubleshooting)
+14. [Roadmap](#roadmap)
 
 ---
 
@@ -33,8 +34,8 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 - [x] REST API (`net/http.ServeMux` Go 1.22+, zero RPC calls on historical GET requests)
 - [x] API validation/pagination (Address format, tx hash, bounded pagination, whitelisted sorting)
 - [x] Continuous live monitoring (Background daemon for real-time finalized block synchronization)
-- [x] Reconciliation engine — Payroll Funding & Salary Claim verification (`reconciliation_exceptions`)
-- [ ] Reconciliation engine — ERC-20 Transfer & Balance verification
+- [x] Reconciliation engine — Payroll Funding, Salary Claim & ERC-20 Transfer verification (`reconciliation_exceptions`)
+- [ ] Reconciliation engine — Contract & Token Balance verification
 - [ ] Dashboard/product integration (Next.js frontend user interface)
 
 | Feature / Milestone | Status | Description |
@@ -51,7 +52,7 @@ The service ingests smart contract events from Sepolia, persists normalized reco
 | **Continuous Live Monitoring**| Completed | Continuous polling loop indexing incoming safe blocks with configurable confirmation depth |
 | **Payroll Funding Reconciler**| Completed | Independent audit comparing on-chain `PayrollFunded` events to database records |
 | **Salary Claim Reconciler** | Completed | Independent audit comparing on-chain `SalaryClaimed` events to database records |
-| **Token Transfer Reconciler** | Next | Independent audit comparing on-chain ERC-20 `Transfer` events to database records |
+| **Token Transfer Reconciler** | Completed | Independent audit comparing on-chain ERC-20 `Transfer` events to database records |
 | **Dashboard UI** | Future | Next.js monitoring dashboard integration |
 
 ---
@@ -519,7 +520,7 @@ curl -s http://localhost:8080/ready
 
 ---
 
-## Reconciliation Worker — Payroll Funding & Salary Claim Safety Checks
+## Reconciliation Worker — Payroll Funding, Salary Claim & Token Transfer Safety Checks
 
 The **Reconciliation Worker** acts as the safety check and audit layer for the WTF On-Chain Monitor. It compares authoritative on-chain state against observed/indexed PostgreSQL database data and creates structured, idempotent exceptions in `reconciliation_exceptions` whenever a mismatch is detected.
 
@@ -528,11 +529,14 @@ The **Reconciliation Worker** acts as the safety check and audit layer for the W
 ### Domain Rules: Smart Contract Storage vs Authoritative Events
 The `MonthlyPayroll` smart contract (`0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC`) maintains running state mappings (`employers`, `employees`, `payrolls`), but **does not expose an iterable historical ledger in contract storage** for past individual funding or claim transactions. 
 
+Similarly, the standard ERC-20 contract (`0x378AFb93CaDd39AFF154704d2D90Af8c401137E7`) maintains current balances in storage (`mapping(address => uint256)`), but historical individual transfers are recorded only through immutable event logs.
+
 Therefore, the authoritative source of truth for historical transactions is the immutable sequence of event logs emitted in transaction receipts on the blockchain:
 - **Payroll Funding**: `event PayrollFunded(address indexed employer, address indexed employee, uint256 amount, uint256 fee, uint256 amountCredited)`
 - **Salary Claims**: `event SalaryClaimed(address indexed employee, uint256 amount)`
+- **WTF Token Transfers**: `event Transfer(address indexed from, address indexed to, uint256 value)`
 
-The reconciler decodes these authoritative on-chain logs and verifies them against the respective indexed database tables (`payroll_fundings` and `salary_claims`) in PostgreSQL.
+The reconciler decodes these authoritative on-chain logs and verifies them against the respective indexed database tables (`payroll_fundings`, `salary_claims`, and `token_transfers`) in PostgreSQL.
 
 ### Discrepancy Classification & Severities
 
@@ -554,22 +558,46 @@ The reconciler decodes these authoritative on-chain logs and verifies them again
 | `SALARY_CLAIM_DUPLICATE` | `high` | Multiple database records exist for the same on-chain `(chain_id, tx_hash, log_index)`. |
 | `SALARY_CLAIM_TX_INCONSISTENCY` | `medium` | Block number or transaction metadata differs between blockchain log and database record. |
 
+#### 3. WTF ERC-20 Token Transfer Discrepancies
+| Mismatch Type | Severity | Description |
+| :--- | :--- | :--- |
+| `TOKEN_TRANSFER_MISSING` | `high` | On-chain `Transfer` event exists within finalized range and token indexer checkpoint, but is absent from `token_transfers`. |
+| `TOKEN_TRANSFER_AMOUNT_MISMATCH` | `high` | Discrepancy in `amount` (exact `*big.Int` arithmetic) between on-chain event and database record. |
+| `TOKEN_TRANSFER_ENTITY_MISMATCH` | `critical` | Sender (`from`) or recipient (`to`) address mismatch between on-chain event and database record. |
+| `TOKEN_TRANSFER_DUPLICATE` | `high` | Multiple database records exist for the same on-chain `(chain_id, token, tx_hash, log_index)`. |
+| `TOKEN_TRANSFER_TX_INCONSISTENCY` | `medium` | Block number or transaction metadata differs between blockchain log and database record. |
+
 ### Lifecycle & Safety Features
 - **Distinguishing Indexing Lag vs Genuine Mismatches**: If an on-chain event is on a block higher than the indexer's checkpoint (`block > indexerCheckpoint`), it is classified as normal indexing lag, not an error, and is not flagged as missing.
+- **Token Address Isolation**: The token reconciler verifies events strictly from the configured `TOKEN_ADDRESS` (ignoring any other ERC-20 contracts on-chain).
+- **Exact Numeric Representation**: All token and payroll amounts are compared as exact unsigned multi-precision integers (`*big.Int`), completely avoiding floating-point rounding errors.
 - **Reorganization Safety (Confirmation Depth)**: Any blocks above `safeTarget = latestBlock - confirmationDepth` are ignored as unfinalized.
 - **System Failure Isolation**: RPC timeouts or database connection drops return clean system errors and abort the run without generating false data mismatch exceptions.
 - **Durable Checkpoint Isolation**:
   - `reconciliation_payroll_funding`: Checkpoint cursor for payroll funding reconciliation.
   - `reconciliation_salary_claim`: Checkpoint cursor for salary claim reconciliation.
-- **Idempotency**: Exception entity references follow a deterministic format (`chain_id:tx_hash:log_index:mismatch_type`). Repeated runs skip already open exceptions without creating duplicate rows.
+  - `reconciliation_erc20_transfers_<token_address>`: Isolated checkpoint cursor per token contract address.
+- **Idempotency**: Exception entity references follow a deterministic format (`{chain_id}:{token_address}:{tx_hash}:{log_index}:{mismatch_type}` for tokens, `{chain_id}:{tx_hash}:{log_index}:{mismatch_type}` for payroll). Repeated runs skip already open exceptions without creating duplicate rows.
 - **Automated Lifecycle Resolution**: When a subsequent reconciliation pass detects that a previously open mismatch has been resolved (e.g. after indexer backfill or fix), it marks the exception `status = 'resolved'` and records `resolved_at`.
 
 ### Running the Reconciliation Worker
 
-#### 1. Salary Claim Reconciliation
+#### 1. WTF ERC-20 Token Transfer Reconciliation
 ```bash
 cd indexer
 
+# Reconcile an explicit block range
+go run ./cmd/reconciler -type token-transfers -from-block 11717931 -to-block 11720000
+
+# Reconcile recent finalized window
+go run ./cmd/reconciler -type token-transfers -window 500
+
+# Continuous reconciliation daemon loop
+go run ./cmd/reconciler -type token-transfers -loop -interval 30s
+```
+
+#### 2. Salary Claim Reconciliation
+```bash
 # Reconcile an explicit block range
 go run ./cmd/reconciler -type salary-claims -from-block 11080692 -to-block 11084000
 
@@ -580,7 +608,7 @@ go run ./cmd/reconciler -type salary-claims -window 500
 go run ./cmd/reconciler -type salary-claims -loop -interval 30s
 ```
 
-#### 2. Payroll Funding Reconciliation
+#### 3. Payroll Funding Reconciliation
 ```bash
 # Explicit range
 go run ./cmd/reconciler -type payroll -from-block 11080692 -to-block 11084000
@@ -589,17 +617,20 @@ go run ./cmd/reconciler -type payroll -from-block 11080692 -to-block 11084000
 go run ./cmd/reconciler -from-block 11080692 -to-block 11084000
 ```
 
-#### 3. Dual / All Reconciliation Checks
+#### 4. Multi-Stream / All Reconciliation Checks
 ```bash
-# Run both Payroll Funding and Salary Claim checks
-go run ./cmd/reconciler -type all -from-block 11080692 -to-block 11084000
+# Run Payroll Funding, Salary Claim, and Token Transfer checks
+go run ./cmd/reconciler -type all -from-block 11717931 -to-block 11720000
 
 # Continuous multi-check daemon
 go run ./cmd/reconciler -type all -loop -interval 30s
 ```
 
-#### 4. Running via Indexer CLI
+#### 5. Running via Indexer CLI
 ```bash
+# Reconcile token transfers
+go run ./cmd/indexer -reconcile -recon-type token-transfers -from-block 11717931 -to-block 11720000
+
 # Reconcile salary claims
 go run ./cmd/indexer -reconcile -recon-type salary-claims -from-block 11080692 -to-block 11084000
 
@@ -607,10 +638,13 @@ go run ./cmd/indexer -reconcile -recon-type salary-claims -from-block 11080692 -
 go run ./cmd/indexer -reconcile -recon-type all
 ```
 
-#### 5. Querying Exceptions via REST API
+#### 6. Querying Exceptions via REST API
 ```bash
 # View open high-severity exceptions
 curl -s "http://localhost:8080/v1/reconciliation/exceptions?status=open&severity=high" | jq .
+
+# Filter specifically for token transfer discrepancies
+curl -s "http://localhost:8080/v1/reconciliation/exceptions?type=TOKEN_TRANSFER_MISSING" | jq .
 
 # Filter specifically for salary claim discrepancies
 curl -s "http://localhost:8080/v1/reconciliation/exceptions?type=SALARY_CLAIM_MISSING" | jq .
@@ -1057,10 +1091,11 @@ go test -v -count=1 ./...
 - [x] Continuous synchronization live monitor daemon
 - [x] Automated Reconciliation Engine — Payroll Funding (`internal/reconciliation`)
 - [x] Automated Reconciliation Engine — Salary Claims (`internal/reconciliation`)
+- [x] Automated Reconciliation Engine — WTF ERC-20 Token Transfers (`internal/reconciliation`)
 - [x] Automated detection, classification, and resolution in `reconciliation_exceptions`
 
 ### Next
-- [ ] ERC-20 Token Transfer & Balance Reconciliation
+- [ ] Contract & Token Balance Reconciliation
 - [ ] Reorganization detection and event rollback handling
 
 ### Future

@@ -196,3 +196,78 @@ func (r *TokensRepository) ListTransfers(ctx context.Context, filter TokenTransf
 
 	return transfers, total, nil
 }
+
+// GetTransfersByBlockRange retrieves all token transfer records for a specific chain, token, and block range [fromBlock, toBlock].
+func (r *TokensRepository) GetTransfersByBlockRange(ctx context.Context, chainID int64, token common.Address, fromBlock, toBlock uint64) ([]*models.TokenTransfer, error) {
+	const query = `
+		SELECT
+			id,
+			chain_id,
+			token,
+			from_address,
+			to_address,
+			amount,
+			tx_hash,
+			block_number,
+			block_timestamp,
+			log_index,
+			removed,
+			created_at
+		FROM token_transfers
+		WHERE chain_id = $1 
+		  AND LOWER(token) = LOWER($2) 
+		  AND block_number >= $3 
+		  AND block_number <= $4
+		ORDER BY block_number ASC, log_index ASC, id ASC
+	`
+	rows, err := r.pool.Query(ctx, query, chainID, token.Hex(), int64(fromBlock), int64(toBlock))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query token transfers by block range: %w", err)
+	}
+	defer rows.Close()
+
+	transfers := make([]*models.TokenTransfer, 0)
+	for rows.Next() {
+		var (
+			id             int64
+			cid            int64
+			tokenStr       string
+			fromStr        string
+			toStr          string
+			amountStr      string
+			txHashStr      string
+			blockNumber    int64
+			blockTimestamp time.Time
+			logIndex       int
+			removed        bool
+			createdAt      time.Time
+		)
+
+		if err := rows.Scan(&id, &cid, &tokenStr, &fromStr, &toStr, &amountStr, &txHashStr, &blockNumber, &blockTimestamp, &logIndex, &removed, &createdAt); err != nil {
+			return nil, fmt.Errorf("failed to scan token transfer row: %w", err)
+		}
+
+		amount, _ := new(big.Int).SetString(amountStr, 10)
+
+		transfers = append(transfers, &models.TokenTransfer{
+			ID:             id,
+			ChainID:        cid,
+			Token:          common.HexToAddress(tokenStr),
+			FromAddress:    common.HexToAddress(fromStr),
+			ToAddress:      common.HexToAddress(toStr),
+			Amount:         amount,
+			TxHash:         common.HexToHash(txHashStr),
+			BlockNumber:    uint64(blockNumber),
+			BlockTimestamp: blockTimestamp.UTC(),
+			LogIndex:       uint(logIndex),
+			Removed:        removed,
+			CreatedAt:      createdAt.UTC(),
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error reading token transfer rows: %w", err)
+	}
+
+	return transfers, nil
+}

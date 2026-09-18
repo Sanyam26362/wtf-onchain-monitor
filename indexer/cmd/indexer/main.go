@@ -37,7 +37,7 @@ func main() {
 	maxRetriesFlag := flag.Int("max-retries", 0, "Override max RPC retries on transient/rate-limit error")
 	initialBackoffFlag := flag.Duration("initial-backoff", 0, "Override initial RPC retry backoff duration (e.g. 1s)")
 	reconcileFlag := flag.Bool("reconcile", false, "Run reconciliation check")
-	reconTypeFlag := flag.String("recon-type", "payroll", "Reconciliation check type ('payroll', 'salary-claims', or 'all')")
+	reconTypeFlag := flag.String("recon-type", "payroll", "Reconciliation check type ('payroll', 'salary-claims', 'token-transfers', or 'all')")
 	reconWindowFlag := flag.Uint64("recon-window", 0, "Override reconciliation block window size (e.g. 500)")
 	flag.Parse()
 
@@ -258,10 +258,12 @@ func main() {
 			normReconType = "payroll"
 		case "salary-claims", "salary-claim", "claims", "claim":
 			normReconType = "salary-claims"
+		case "token-transfers", "token-transfer", "tokens", "token":
+			normReconType = "token-transfers"
 		case "all", "both":
 			normReconType = "all"
 		default:
-			log.Fatalf("unsupported reconciliation type %q: must be 'payroll', 'salary-claims', or 'all'", *reconTypeFlag)
+			log.Fatalf("unsupported reconciliation type %q: must be 'payroll', 'salary-claims', 'token-transfers', or 'all'", *reconTypeFlag)
 		}
 
 		fmt.Println("\n==================================================")
@@ -270,10 +272,7 @@ func main() {
 
 		reconRepo := repository.NewReconciliationRepository(db.Pool())
 		payrollRepo := repository.NewPayrollRepository(db.Pool())
-		eventDecoder, err := decoder.New(common.HexToAddress(cfg.PayrollContractAddress))
-		if err != nil {
-			log.Fatalf("failed to initialize event decoder for reconciliation: %v", err)
-		}
+		tokensRepo := repository.NewTokensRepository(db.Pool())
 
 		retryPolicy := indexer.RetryPolicy{
 			MaxRetries:     cfg.RPCMaxRetries,
@@ -284,6 +283,11 @@ func main() {
 		}
 
 		if normReconType == "payroll" || normReconType == "all" {
+			eventDecoder, err := decoder.New(common.HexToAddress(cfg.PayrollContractAddress))
+			if err != nil {
+				log.Fatalf("failed to initialize event decoder for payroll reconciliation: %v", err)
+			}
+
 			reconCfg := reconciliation.PayrollReconcilerConfig{
 				ChainID:           cfg.ChainID,
 				ContractAddress:   common.HexToAddress(cfg.PayrollContractAddress),
@@ -322,6 +326,11 @@ func main() {
 		}
 
 		if normReconType == "salary-claims" || normReconType == "all" {
+			eventDecoder, err := decoder.New(common.HexToAddress(cfg.PayrollContractAddress))
+			if err != nil {
+				log.Fatalf("failed to initialize event decoder for salary claim reconciliation: %v", err)
+			}
+
 			claimReconCfg := reconciliation.SalaryClaimReconcilerConfig{
 				ChainID:           cfg.ChainID,
 				ContractAddress:   common.HexToAddress(cfg.PayrollContractAddress),
@@ -357,6 +366,71 @@ func main() {
 				log.Fatalf("salary claim reconciliation execution failed: %v", err)
 			}
 			printReconciliationSummary("Salary Claim", res)
+		}
+
+		if normReconType == "token-transfers" || normReconType == "all" {
+			if cfg.TokenAddress == "" {
+				log.Fatalf("TOKEN_ADDRESS is required for token transfer reconciliation")
+			}
+			if err := cfg.ValidateTokenConfig(); err != nil {
+				log.Fatalf("invalid token configuration for reconciliation: %v", err)
+			}
+
+			tokenAddr := common.HexToAddress(cfg.TokenAddress)
+			tokenFilterer, fErr := indexerABI.NewGenericERC20Filterer(tokenAddr, cfg.ParsedTokenABI)
+			if fErr != nil {
+				log.Fatalf("failed to initialize token filterer: %v", fErr)
+			}
+			erc20Decoder, dErr := decoder.NewERC20Decoder(tokenFilterer)
+			if dErr != nil {
+				log.Fatalf("failed to initialize ERC-20 decoder: %v", dErr)
+			}
+
+			tokenReconCfg := reconciliation.TokenTransferReconcilerConfig{
+				ChainID:           cfg.ChainID,
+				TokenAddress:      tokenAddr,
+				TokenStreamID:     cfg.TokenStreamID,
+				ReconStreamID:     cfg.ReconciliationTokenStreamID,
+				ConfirmationDepth: cfg.ConfirmationDepth,
+				BlockWindow:       cfg.ReconciliationBlockWindow,
+				StartBlock:        cfg.TokenStartBlock,
+			}
+
+			tokenReconciler, err := reconciliation.NewTokenTransferReconciler(
+				tokenReconCfg,
+				client,
+				erc20Decoder,
+				tokensRepo,
+				reconRepo,
+				db,
+			)
+			if err != nil {
+				log.Fatalf("failed to initialize token transfer reconciler: %v", err)
+			}
+			tokenReconciler.SetRetryPolicy(retryPolicy)
+
+			tokenStart := cfg.TokenStartBlock
+			tokenTarget := targetBlock
+			if tokenTarget < tokenStart {
+				var safeBlock uint64 = latestBlock
+				if cfg.ConfirmationDepth > 0 && latestBlock >= cfg.ConfirmationDepth {
+					safeBlock = latestBlock - cfg.ConfirmationDepth
+				}
+				tokenTarget = safeBlock
+			}
+
+			var res *reconciliation.ReconciliationResult
+			if *reconWindowFlag > 0 {
+				fmt.Printf("Reconciling token transfers recent window of %d blocks...\n", *reconWindowFlag)
+				res, err = tokenReconciler.ReconcileRecentWindow(ctx, *reconWindowFlag)
+			} else {
+				fmt.Printf("Reconciling token transfers range %d -> %d...\n", tokenStart, tokenTarget)
+				res, err = tokenReconciler.ReconcileRange(ctx, tokenStart, tokenTarget)
+			}
+			if err != nil {
+				log.Fatalf("token transfer reconciliation execution failed: %v", err)
+			}
+			printReconciliationSummary("Token Transfer", res)
 		}
 
 		fmt.Println("==================================================")

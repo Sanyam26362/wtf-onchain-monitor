@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
 
+	indexerABI "worldtradefuture/indexer/internal/abi"
 	"worldtradefuture/indexer/internal/blockchain"
 	"worldtradefuture/indexer/internal/config"
 	"worldtradefuture/indexer/internal/decoder"
@@ -25,7 +26,7 @@ import (
 )
 
 func main() {
-	typeFlag := flag.String("type", "payroll", "Reconciliation type: 'payroll' (or 'payroll-funding'), 'salary-claims' (or 'salary-claim'), or 'all'")
+	typeFlag := flag.String("type", "payroll", "Reconciliation type: 'payroll' (or 'payroll-funding'), 'salary-claims' (or 'salary-claim'), 'token-transfers' (or 'tokens'), or 'all'")
 	fromBlockFlag := flag.Uint64("from-block", 0, "Start block for reconciliation range")
 	toBlockFlag := flag.Uint64("to-block", 0, "Target block for reconciliation range")
 	windowFlag := flag.Uint64("window", 0, "Reconcile recent block window (e.g. 500)")
@@ -45,10 +46,12 @@ func main() {
 		normType = "payroll"
 	case "salary-claims", "salary-claim", "claims", "claim":
 		normType = "salary-claims"
+	case "token-transfers", "token-transfer", "tokens", "token":
+		normType = "token-transfers"
 	case "all", "both":
 		normType = "all"
 	default:
-		log.Fatalf("unsupported reconciliation type %q: must be 'payroll', 'salary-claims', or 'all'", *typeFlag)
+		log.Fatalf("unsupported reconciliation type %q: must be 'payroll', 'salary-claims', 'token-transfers', or 'all'", *typeFlag)
 	}
 
 	fmt.Println("==================================================")
@@ -64,8 +67,11 @@ func main() {
 		log.Fatalf("configuration error: %v", err)
 	}
 
-	if cfg.PayrollContractAddress == "" {
+	if (normType == "payroll" || normType == "salary-claims" || normType == "all") && cfg.PayrollContractAddress == "" {
 		log.Fatalf("PAYROLL_CONTRACT_ADDRESS is required for payroll reconciliation")
+	}
+	if (normType == "token-transfers" || normType == "all") && cfg.TokenAddress == "" {
+		log.Fatalf("TOKEN_ADDRESS is required for token transfer reconciliation")
 	}
 
 	interval := cfg.ReconciliationInterval
@@ -90,12 +96,7 @@ func main() {
 
 	reconRepo := repository.NewReconciliationRepository(db.Pool())
 	payrollRepo := repository.NewPayrollRepository(db.Pool())
-
-	contractAddr := common.HexToAddress(cfg.PayrollContractAddress)
-	eventDecoder, err := decoder.New(contractAddr)
-	if err != nil {
-		log.Fatalf("failed to initialize event decoder: %v", err)
-	}
+	tokensRepo := repository.NewTokensRepository(db.Pool())
 
 	retryPolicy := indexer.RetryPolicy{
 		MaxRetries:     cfg.RPCMaxRetries,
@@ -106,64 +107,119 @@ func main() {
 	}
 
 	var payrollReconciler *reconciliation.PayrollReconciler
-	if normType == "payroll" || normType == "all" {
-		reconCfg := reconciliation.PayrollReconcilerConfig{
-			ChainID:           cfg.ChainID,
-			ContractAddress:   contractAddr,
-			PayrollStreamID:   cfg.PayrollStreamID,
-			ReconStreamID:     cfg.ReconciliationStreamID,
-			ConfirmationDepth: cfg.ConfirmationDepth,
-			BlockWindow:       cfg.ReconciliationBlockWindow,
-			StartBlock:        cfg.StartBlock,
+	var salaryClaimReconciler *reconciliation.SalaryClaimReconciler
+
+	if normType == "payroll" || normType == "salary-claims" || normType == "all" {
+		contractAddr := common.HexToAddress(cfg.PayrollContractAddress)
+		eventDecoder, decErr := decoder.New(contractAddr)
+		if decErr != nil {
+			log.Fatalf("failed to initialize payroll event decoder: %v", decErr)
 		}
 
-		payrollReconciler, err = reconciliation.NewPayrollReconciler(
-			reconCfg,
-			client,
-			eventDecoder,
-			payrollRepo,
-			reconRepo,
-			db,
-		)
-		if err != nil {
-			log.Fatalf("failed to initialize payroll reconciler: %v", err)
+		if normType == "payroll" || normType == "all" {
+			reconCfg := reconciliation.PayrollReconcilerConfig{
+				ChainID:           cfg.ChainID,
+				ContractAddress:   contractAddr,
+				PayrollStreamID:   cfg.PayrollStreamID,
+				ReconStreamID:     cfg.ReconciliationStreamID,
+				ConfirmationDepth: cfg.ConfirmationDepth,
+				BlockWindow:       cfg.ReconciliationBlockWindow,
+				StartBlock:        cfg.StartBlock,
+			}
+
+			payrollReconciler, err = reconciliation.NewPayrollReconciler(
+				reconCfg,
+				client,
+				eventDecoder,
+				payrollRepo,
+				reconRepo,
+				db,
+			)
+			if err != nil {
+				log.Fatalf("failed to initialize payroll reconciler: %v", err)
+			}
+			payrollReconciler.SetRetryPolicy(retryPolicy)
 		}
-		payrollReconciler.SetRetryPolicy(retryPolicy)
+
+		if normType == "salary-claims" || normType == "all" {
+			claimReconCfg := reconciliation.SalaryClaimReconcilerConfig{
+				ChainID:           cfg.ChainID,
+				ContractAddress:   contractAddr,
+				PayrollStreamID:   cfg.PayrollStreamID,
+				ReconStreamID:     cfg.ReconciliationSalaryClaimStreamID,
+				ConfirmationDepth: cfg.ConfirmationDepth,
+				BlockWindow:       cfg.ReconciliationBlockWindow,
+				StartBlock:        cfg.StartBlock,
+			}
+
+			salaryClaimReconciler, err = reconciliation.NewSalaryClaimReconciler(
+				claimReconCfg,
+				client,
+				eventDecoder,
+				payrollRepo,
+				reconRepo,
+				db,
+			)
+			if err != nil {
+				log.Fatalf("failed to initialize salary claim reconciler: %v", err)
+			}
+			salaryClaimReconciler.SetRetryPolicy(retryPolicy)
+		}
 	}
 
-	var salaryClaimReconciler *reconciliation.SalaryClaimReconciler
-	if normType == "salary-claims" || normType == "all" {
-		claimReconCfg := reconciliation.SalaryClaimReconcilerConfig{
-			ChainID:           cfg.ChainID,
-			ContractAddress:   contractAddr,
-			PayrollStreamID:   cfg.PayrollStreamID,
-			ReconStreamID:     cfg.ReconciliationSalaryClaimStreamID,
-			ConfirmationDepth: cfg.ConfirmationDepth,
-			BlockWindow:       cfg.ReconciliationBlockWindow,
-			StartBlock:        cfg.StartBlock,
+	var tokenReconciler *reconciliation.TokenTransferReconciler
+	if normType == "token-transfers" || normType == "all" {
+		if err := cfg.ValidateTokenConfig(); err != nil {
+			log.Fatalf("invalid token configuration for reconciliation: %v", err)
 		}
 
-		salaryClaimReconciler, err = reconciliation.NewSalaryClaimReconciler(
-			claimReconCfg,
+		tokenAddr := common.HexToAddress(cfg.TokenAddress)
+		tokenFilterer, fErr := indexerABI.NewGenericERC20Filterer(tokenAddr, cfg.ParsedTokenABI)
+		if fErr != nil {
+			log.Fatalf("failed to initialize token filterer: %v", fErr)
+		}
+		erc20Decoder, dErr := decoder.NewERC20Decoder(tokenFilterer)
+		if dErr != nil {
+			log.Fatalf("failed to initialize ERC-20 decoder: %v", dErr)
+		}
+
+		tokenReconCfg := reconciliation.TokenTransferReconcilerConfig{
+			ChainID:           cfg.ChainID,
+			TokenAddress:      tokenAddr,
+			TokenStreamID:     cfg.TokenStreamID,
+			ReconStreamID:     cfg.ReconciliationTokenStreamID,
+			ConfirmationDepth: cfg.ConfirmationDepth,
+			BlockWindow:       cfg.ReconciliationBlockWindow,
+			StartBlock:        cfg.TokenStartBlock,
+		}
+
+		tokenReconciler, err = reconciliation.NewTokenTransferReconciler(
+			tokenReconCfg,
 			client,
-			eventDecoder,
-			payrollRepo,
+			erc20Decoder,
+			tokensRepo,
 			reconRepo,
 			db,
 		)
 		if err != nil {
-			log.Fatalf("failed to initialize salary claim reconciler: %v", err)
+			log.Fatalf("failed to initialize token transfer reconciler: %v", err)
 		}
-		salaryClaimReconciler.SetRetryPolicy(retryPolicy)
+		tokenReconciler.SetRetryPolicy(retryPolicy)
 	}
 
 	fmt.Printf("Chain ID:                %d\n", cfg.ChainID)
-	fmt.Printf("Payroll Contract:        %s\n", cfg.PayrollContractAddress)
+	if cfg.PayrollContractAddress != "" && (payrollReconciler != nil || salaryClaimReconciler != nil) {
+		fmt.Printf("Payroll Contract:        %s\n", cfg.PayrollContractAddress)
+	}
 	if payrollReconciler != nil {
 		fmt.Printf("Payroll Recon Stream ID: %s\n", cfg.ReconciliationStreamID)
 	}
 	if salaryClaimReconciler != nil {
 		fmt.Printf("Claim Recon Stream ID:   %s\n", cfg.ReconciliationSalaryClaimStreamID)
+	}
+	if tokenReconciler != nil {
+		fmt.Printf("Token Contract:          %s\n", cfg.TokenAddress)
+		fmt.Printf("Token Recon Stream ID:   %s\n", cfg.ReconciliationTokenStreamID)
 	}
 	fmt.Printf("Confirmation Depth:      %d\n", cfg.ConfirmationDepth)
 	if *loopFlag {
@@ -222,6 +278,29 @@ func main() {
 			}
 
 			printSummary("Salary Claim Reconciliation", res)
+		}
+
+		if tokenReconciler != nil {
+			var res *reconciliation.ReconciliationResult
+			var tErr error
+
+			if *windowFlag > 0 {
+				res, tErr = tokenReconciler.ReconcileRecentWindow(ctx, *windowFlag)
+			} else if *fromBlockFlag > 0 && *toBlockFlag > 0 {
+				res, tErr = tokenReconciler.ReconcileRange(ctx, *fromBlockFlag, *toBlockFlag)
+			} else {
+				batchSize := cfg.BlockBatchSize
+				if *batchSizeFlag > 0 {
+					batchSize = *batchSizeFlag
+				}
+				res, tErr = tokenReconciler.ReconcileNextBatch(ctx, batchSize)
+			}
+
+			if tErr != nil {
+				return fmt.Errorf("token transfer reconciliation failed: %w", tErr)
+			}
+
+			printSummary("WTF Token Transfer Reconciliation", res)
 		}
 		return nil
 	}

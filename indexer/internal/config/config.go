@@ -52,6 +52,7 @@ type Config struct {
 	ReconciliationInterval            time.Duration
 	ReconciliationStreamID            string
 	ReconciliationSalaryClaimStreamID string
+	ReconciliationTokenStreamID       string
 
 	// ParsedTokenABI is populated and cached after successful validation.
 	ParsedTokenABI *abi.ABI
@@ -260,6 +261,15 @@ func Load() (Config, error) {
 		reconSalaryClaimStreamID = "reconciliation_salary_claim"
 	}
 
+	reconTokenStreamID := os.Getenv("RECONCILIATION_TOKEN_STREAM_ID")
+	if reconTokenStreamID == "" {
+		if tokenAddress != "" {
+			reconTokenStreamID = fmt.Sprintf("reconciliation_erc20_transfers_%s", strings.ToLower(tokenAddress))
+		} else {
+			reconTokenStreamID = "reconciliation_erc20_transfers"
+		}
+	}
+
 	cfg := Config{
 		ChainID:                           chainID,
 		RPCURL:                            rpcURL,
@@ -293,6 +303,7 @@ func Load() (Config, error) {
 		ReconciliationInterval:            reconInterval,
 		ReconciliationStreamID:            reconStreamID,
 		ReconciliationSalaryClaimStreamID: reconSalaryClaimStreamID,
+		ReconciliationTokenStreamID:       reconTokenStreamID,
 	}
 
 	return cfg, nil
