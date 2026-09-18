@@ -154,6 +154,10 @@ Configuration is loaded from environment variables (or local `indexer/.env`). Se
 | `CORS_ALLOWED_ORIGINS` | No | `*` | Allowed CORS origins (comma-separated or `*`) |
 | `EXPLORER_TX_URL_TEMPLATE`| No | Network-based | Custom explorer URL template (e.g. `https://sepolia.etherscan.io/tx/%s`) |
 | `OPERATOR_API_KEY` | For Operator| - | Secret key protecting `/v1/sync/backfill` |
+| `RPC_MAX_RETRIES` | No | `5` | Maximum retries on transient RPC failures and 429 rate limits |
+| `RPC_INITIAL_BACKOFF` | No | `1s` | Initial exponential backoff duration before first retry |
+| `RPC_MAX_BACKOFF` | No | `30s` | Maximum ceiling for exponential backoff delay |
+| `RPC_BACKOFF_FACTOR` | No | `2.0` | Multiplicative factor for exponential backoff doubling |
 
 ---
 
@@ -233,6 +237,42 @@ go run ./cmd/indexer
 - **Idempotency Guarantee**: All persistence calls use `ON CONFLICT DO UPDATE` or `ON CONFLICT DO NOTHING` against unique constraints `(chain_id, contract_address, tx_hash, log_index)`. Replaying blocks does not duplicate records.
 - **Domain Projections**: When `EmployeeAdded` events are detected, the indexer automatically satisfies the employer foreign key and inserts/updates the `employees` table. `EmployeeRemoved` updates the employee's active status to `false`. Funding and claim events are projected into `payroll_fundings` and `salary_claims`.
 
+#### RPC Rate-Limit Handling & Resilient Backfill
+
+Historical backfill frequently spans hundreds of thousands of blocks against public/shared JSON-RPC infrastructure (e.g., Infura free tier with 10 req/s rate limits and 100,000 req/day caps). The indexer includes a dedicated, conservative retry engine designed to avoid crashing during bursts while strictly guarding checkpoint integrity.
+
+1. **Classification of Transient vs. Permanent Errors**:
+   - **Retryable Transient Errors**:
+     - HTTP `429 Too Many Requests`, `project rate limit reached` (`code: -32005`), `compute units per second exceeded`.
+     - Transport/network connection errors: `connection reset by peer`, `broken pipe`, `unexpected EOF`, `i/o timeout`, `network is unreachable`.
+     - HTTP server and gateway errors: `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout`, `500 Internal Server Error`.
+   - **Non-Retryable Errors**: Context cancellations (`SIGINT`/`SIGTERM`), contract reverts, invalid ABI specifications, and SQL schema errors immediately abort the loop without wasting retries.
+
+2. **Exponential Backoff Strategy**:
+   - Initial backoff begins at `RPC_INITIAL_BACKOFF` (default: `1s`, or `--initial-backoff`).
+   - Each successive retry multiplies the delay by `RPC_BACKOFF_FACTOR` (default: `2.0`).
+   - Delays are hard-capped at `RPC_MAX_BACKOFF` (default: `30s`).
+   - Progression: `1s` ➔ `2s` ➔ `4s` ➔ `8s` ➔ `16s` ➔ `30s (cap)`.
+
+3. **Maximum Retry Count**:
+   - Configurable via `RPC_MAX_RETRIES` (default: `5`, or `--max-retries`).
+   - If an RPC endpoint remains unresponsive after 5 attempts, the indexer logs a fatal error and cleanly exits.
+
+4. **Strict Checkpoint Safety Invariant**:
+   - Processing order is strictly guaranteed:
+     $$\text{Fetch Logs} \longrightarrow \text{Decode ABI} \longrightarrow \text{Persist Events \& Projections} \longrightarrow \text{Update Checkpoint}$$
+   - Checkpoints in `sync_checkpoints` are **never** updated before or during range execution.
+   - If range `[11083701, 11083750]` encounters an RPC failure, the checkpoint remains at `11083700` until that range is 100% successfully written and committed.
+   - On process restart, the indexer resumes strictly from `last_indexed_block + 1` (`11083701`).
+
+5. **Structured Logging & Secret Sanitization**:
+   - All retry events emit structured `slog` logs containing `stream`, `from`, `to`, `attempt`, `max_retries`, and `retry_in`.
+   - Infura project IDs, API keys, and bearer tokens in RPC URLs or headers are automatically redacted matching regex patterns (`[REDACTED]`).
+
+```bash
+# Run historical backfill with explicit retry parameters
+go run ./cmd/indexer --stream payroll --to-block 11084000 --batch-size 50 --max-retries 5 --initial-backoff 1s
+```
 
 ### 3. Running the REST API Server
 To start the REST API service:
