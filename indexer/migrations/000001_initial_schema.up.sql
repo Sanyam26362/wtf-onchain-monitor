@@ -42,8 +42,7 @@ CREATE TABLE IF NOT EXISTS employees (
     removed_at TIMESTAMP WITH TIME ZONE,
     latest_tx_hash VARCHAR(66),
     chain_id BIGINT NOT NULL,
-    CONSTRAINT employees_pkey PRIMARY KEY (chain_id, wallet),
-    CONSTRAINT fk_employee_employer FOREIGN KEY (chain_id, employer) REFERENCES employers(chain_id, wallet)
+    CONSTRAINT employees_pkey PRIMARY KEY (chain_id, wallet)
 );
 
 CREATE TABLE IF NOT EXISTS chain_events (
@@ -58,8 +57,7 @@ CREATE TABLE IF NOT EXISTS chain_events (
     removed BOOLEAN DEFAULT FALSE NOT NULL,
     raw_data JSONB NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-    CONSTRAINT uq_chain_event UNIQUE (chain_id, contract_address, tx_hash, log_index),
-    CONSTRAINT fk_chain_event_transaction FOREIGN KEY (chain_id, tx_hash) REFERENCES transactions(chain_id, tx_hash)
+    CONSTRAINT uq_chain_event UNIQUE (chain_id, contract_address, tx_hash, log_index)
 );
 
 CREATE TABLE IF NOT EXISTS payroll_fundings (
@@ -74,10 +72,7 @@ CREATE TABLE IF NOT EXISTS payroll_fundings (
     block_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
     log_index INTEGER NOT NULL,
     chain_id BIGINT NOT NULL,
-    CONSTRAINT uq_payroll_funding_event UNIQUE (chain_id, tx_hash, log_index),
-    CONSTRAINT fk_payroll_funding_employer FOREIGN KEY (chain_id, employer) REFERENCES employers(chain_id, wallet),
-    CONSTRAINT fk_payroll_funding_employee FOREIGN KEY (chain_id, employee) REFERENCES employees(chain_id, wallet),
-    CONSTRAINT fk_payroll_funding_transaction FOREIGN KEY (chain_id, tx_hash) REFERENCES transactions(chain_id, tx_hash)
+    CONSTRAINT uq_payroll_funding_event UNIQUE (chain_id, tx_hash, log_index)
 );
 
 CREATE TABLE IF NOT EXISTS salary_claims (
@@ -89,8 +84,7 @@ CREATE TABLE IF NOT EXISTS salary_claims (
     block_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
     log_index INTEGER NOT NULL,
     chain_id BIGINT NOT NULL,
-    CONSTRAINT uq_salary_claim_event UNIQUE (chain_id, tx_hash, log_index),
-    CONSTRAINT fk_salary_claim_employee FOREIGN KEY (chain_id, employee) REFERENCES employees(chain_id, wallet)
+    CONSTRAINT uq_salary_claim_event UNIQUE (chain_id, tx_hash, log_index)
 );
 
 CREATE TABLE IF NOT EXISTS reconciliation_exceptions (

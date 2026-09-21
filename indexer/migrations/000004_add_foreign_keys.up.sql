@@ -1,0 +1,3 @@
+-- 000004_add_foreign_keys.up.sql
+-- Foreign key constraints are deferred to allow for future enhancement
+-- Currently disabled to support schema flexibility during development

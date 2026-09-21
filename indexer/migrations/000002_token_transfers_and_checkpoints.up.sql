@@ -24,8 +24,7 @@ CREATE TABLE IF NOT EXISTS token_transfers (
     log_index INTEGER NOT NULL,
     removed BOOLEAN DEFAULT FALSE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-    CONSTRAINT uq_token_transfer UNIQUE (chain_id, token, tx_hash, log_index),
-    CONSTRAINT fk_token_transfer_transaction FOREIGN KEY (chain_id, tx_hash) REFERENCES transactions(chain_id, tx_hash)
+    CONSTRAINT uq_token_transfer UNIQUE (chain_id, token, tx_hash, log_index)
 );
 
 -- 3. Indexes for efficient queries by token, address, and block
