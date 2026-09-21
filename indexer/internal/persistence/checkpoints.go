@@ -8,6 +8,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Checkpoint represents a stored indexing checkpoint containing both block number and hash.
+type Checkpoint struct {
+	BlockNumber uint64
+	BlockHash   string
+}
+
 // GetCheckpoint retrieves the last indexed block for a stream on a chain.
 // If no checkpoint exists, it returns ok = false and block = 0.
 func (p *Postgres) GetCheckpoint(
@@ -31,6 +37,37 @@ func (p *Postgres) GetCheckpoint(
 	}
 
 	return uint64(lastIndexedBlock), true, nil
+}
+
+// GetCheckpointWithHash retrieves the last indexed block and block hash for a stream on a chain.
+// If no checkpoint exists, it returns nil, false, nil.
+func (p *Postgres) GetCheckpointWithHash(
+	ctx context.Context,
+	chainID int64,
+	streamID string,
+) (*Checkpoint, bool, error) {
+	const query = `
+		SELECT last_indexed_block, COALESCE(last_block_hash, '')
+		FROM sync_checkpoints
+		WHERE chain_id = $1 AND stream_id = $2
+	`
+
+	var (
+		lastIndexedBlock int64
+		lastBlockHash    string
+	)
+	err := p.pool.QueryRow(ctx, query, chainID, streamID).Scan(&lastIndexedBlock, &lastBlockHash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to query checkpoint with hash for %s (chain %d): %w", streamID, chainID, err)
+	}
+
+	return &Checkpoint{
+		BlockNumber: uint64(lastIndexedBlock),
+		BlockHash:   lastBlockHash,
+	}, true, nil
 }
 
 // SaveCheckpoint updates or creates the checkpoint record for a stream.

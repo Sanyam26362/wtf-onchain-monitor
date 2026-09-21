@@ -213,8 +213,18 @@ func (m *LiveMonitor) PollPayroll(ctx context.Context, safeTarget uint64) (int, 
 			return totalEvents, fmt.Errorf("index payroll range [%d, %d]: %w", from, to, err)
 		}
 
+		header, err := m.client.BlockHeader(ctx, to)
+		if err != nil {
+			slog.Error("failed to fetch block header for payroll checkpoint",
+				"stream", m.cfg.PayrollStreamID,
+				"checkpoint", to,
+				"error", err,
+			)
+			return totalEvents, fmt.Errorf("fetch block header for payroll checkpoint at block %d: %w", to, err)
+		}
+
 		// Save checkpoint only after successful persistence of events and projections
-		if err := m.persistence.SaveCheckpoint(ctx, m.cfg.ChainID, m.cfg.PayrollStreamID, to, ""); err != nil {
+		if err := m.persistence.SaveCheckpoint(ctx, m.cfg.ChainID, m.cfg.PayrollStreamID, to, header.Hash.Hex()); err != nil {
 			slog.Error("failed to save payroll checkpoint",
 				"stream", m.cfg.PayrollStreamID,
 				"checkpoint", to,
@@ -229,6 +239,7 @@ func (m *LiveMonitor) PollPayroll(ctx context.Context, safeTarget uint64) (int, 
 			"events_found", len(events),
 			"events_persisted", len(events),
 			"checkpoint", to,
+			"hash", header.Hash.Hex(),
 		)
 
 		batchesProcessed++

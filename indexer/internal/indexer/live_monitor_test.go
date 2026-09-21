@@ -230,6 +230,51 @@ func TestLiveMonitor_CheckpointAdvancementAfterSuccess(t *testing.T) {
 	if !found || cp != 195 {
 		t.Fatalf("expected checkpoint 195 after chunked batches, got %d", cp)
 	}
+
+	key := fmt.Sprintf("%d:%s", chainID, streamID)
+	expectedHash195 := common.HexToHash(fmt.Sprintf("0x%064x", 195)).Hex()
+	if mockDB.checkpointHashes[key] != expectedHash195 {
+		t.Fatalf("expected checkpoint hash %s, got %s", expectedHash195, mockDB.checkpointHashes[key])
+	}
+}
+
+func TestLiveMonitor_BlockHeaderFailure_CheckpointDoesNotAdvance(t *testing.T) {
+	ctx := context.Background()
+	chainID := int64(11155111)
+	mockDB := newMockPayrollPersistence()
+	mockClient := &mockPayrollClient{
+		latestBlock:     200,
+		failBlockHeader: true, // Header retrieval fails
+	}
+
+	payrollAddr := common.HexToAddress("0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC")
+	dec, _ := decoder.New(payrollAddr)
+	svc, _ := NewWithDecoder(mockClient, dec, mockDB)
+
+	streamID := "monthly_payroll"
+	_ = mockDB.SaveCheckpoint(ctx, chainID, streamID, 100, "")
+
+	cfg := LiveMonitorConfig{
+		ChainID:                chainID,
+		ConfirmationDepth:      5,
+		BatchSize:              50,
+		PollInterval:           50 * time.Millisecond,
+		PayrollContractAddress: payrollAddr,
+		PayrollStreamID:        streamID,
+		PayrollStartBlock:      100,
+	}
+
+	monitor, _ := NewLiveMonitor(cfg, mockClient, svc, nil, mockDB)
+	_, err := monitor.PollPayroll(ctx, 195)
+	if err == nil {
+		t.Fatal("expected error on block header failure, got nil")
+	}
+
+	// Verify checkpoint remains unchanged at 100
+	cp, found, _ := mockDB.GetCheckpoint(ctx, chainID, streamID)
+	if !found || cp != 100 {
+		t.Fatalf("expected checkpoint to stay at 100, got %d (found=%t)", cp, found)
+	}
 }
 
 // TestLiveMonitor_CheckpointNotAdvancingAfterFailure tests requirement 15.6:

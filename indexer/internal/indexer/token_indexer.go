@@ -327,6 +327,17 @@ func (ti *TokenIndexer) IndexRange(
 		}
 	}
 
+	// Fetch block header to ensure the checkpoint stores the real block hash corresponding to toBlock
+	header, err := ti.client.BlockHeader(ctx, toBlock)
+	if err != nil {
+		slog.Error("failed to fetch block header for checkpoint",
+			"stream_id", ti.streamID,
+			"checkpoint_block", toBlock,
+			"error", err,
+		)
+		return nil, fmt.Errorf("fetch block header for checkpoint block %d: %w", toBlock, err)
+	}
+
 	// Persist transactions, raw events, normalized transfers, and checkpoint atomically
 	err = ti.persistence.SaveTokenBatch(
 		ctx,
@@ -336,7 +347,7 @@ func (ti *TokenIndexer) IndexRange(
 		rawEvents,
 		transfers,
 		toBlock,
-		"",
+		header.Hash.Hex(),
 	)
 	if err != nil {
 		slog.Error("failed to persist token batch",
@@ -356,6 +367,7 @@ func (ti *TokenIndexer) IndexRange(
 		"to_block", toBlock,
 		"transfers_indexed", len(transfers),
 		"checkpoint_advanced_to", toBlock,
+		"checkpoint_hash", header.Hash.Hex(),
 	)
 
 	return transfers, nil

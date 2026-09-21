@@ -13,6 +13,14 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
+// BlockHeader contains block number, block hash, parent hash, and timestamp for reorg detection.
+type BlockHeader struct {
+	Number     uint64
+	Hash       common.Hash
+	ParentHash common.Hash
+	Timestamp  uint64
+}
+
 // BlockchainClient defines the interface for interacting with the blockchain.
 type BlockchainClient interface {
 	LatestBlock(ctx context.Context) (uint64, error)
@@ -20,6 +28,7 @@ type BlockchainClient interface {
 	GetTokenLogs(ctx context.Context, tokenAddress common.Address, topic common.Hash, fromBlock uint64, toBlock uint64) ([]types.Log, error)
 	TransactionMetadata(ctx context.Context, txHash common.Hash) (*TransactionMetadata, error)
 	BlockTimestamp(ctx context.Context, blockNumber uint64) (uint64, error)
+	BlockHeader(ctx context.Context, blockNumber uint64) (*BlockHeader, error)
 	CallContract(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
 	Close()
 }
@@ -27,6 +36,9 @@ type BlockchainClient interface {
 type Client struct {
 	eth *ethclient.Client
 }
+
+// Compile-time assertion that *Client satisfies the BlockchainClient interface.
+var _ BlockchainClient = (*Client)(nil)
 
 type TransactionMetadata struct {
 	Hash        common.Hash
@@ -187,6 +199,33 @@ func (c *Client) BlockTimestamp(
 	}
 
 	return timestamp, nil
+}
+
+// BlockHeader fetches the block header for a specific block number, returning
+// block number, block hash, parent hash, and timestamp for reorg detection.
+func (c *Client) BlockHeader(
+	ctx context.Context,
+	blockNumber uint64,
+) (*BlockHeader, error) {
+	var header *types.Header
+	err := retry(ctx, 3, 300*time.Millisecond, func() error {
+		var qErr error
+		header, qErr = c.eth.HeaderByNumber(ctx, new(big.Int).SetUint64(blockNumber))
+		return qErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch block header for %d: %w", blockNumber, err)
+	}
+	if header == nil {
+		return nil, fmt.Errorf("block header for %d is nil", blockNumber)
+	}
+
+	return &BlockHeader{
+		Number:     header.Number.Uint64(),
+		Hash:       header.Hash(),
+		ParentHash: header.ParentHash,
+		Timestamp:  header.Time,
+	}, nil
 }
 
 func (c *Client) CallContract(

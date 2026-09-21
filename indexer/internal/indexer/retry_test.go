@@ -357,6 +357,15 @@ func (m *flakyPayrollClient) BlockTimestamp(ctx context.Context, blockNumber uin
 	return 1700000000, nil
 }
 
+func (m *flakyPayrollClient) BlockHeader(ctx context.Context, blockNumber uint64) (*blockchain.BlockHeader, error) {
+	return &blockchain.BlockHeader{
+		Number:     blockNumber,
+		Hash:       common.HexToHash(fmt.Sprintf("0x%064x", blockNumber)),
+		ParentHash: common.HexToHash(fmt.Sprintf("0x%064x", blockNumber-1)),
+		Timestamp:  1700000000 + blockNumber,
+	}, nil
+}
+
 func (m *flakyPayrollClient) Close() {}
 
 func (m *flakyPayrollClient) CallContract(ctx context.Context, msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {

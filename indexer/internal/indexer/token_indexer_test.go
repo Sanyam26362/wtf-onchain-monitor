@@ -26,8 +26,10 @@ type mockBlockchainClient struct {
 	failGetTokenLogs bool
 	failLatestBlock  bool
 	failBlockTime    bool
+	failBlockHeader  bool
 	blockTimestamp   uint64
 	txMetadata       *blockchain.TransactionMetadata
+	blockHeaders     map[uint64]*blockchain.BlockHeader
 }
 
 func (m *mockBlockchainClient) LatestBlock(ctx context.Context) (uint64, error) {
@@ -77,6 +79,23 @@ func (m *mockBlockchainClient) BlockTimestamp(ctx context.Context, blockNumber u
 		return m.blockTimestamp, nil
 	}
 	return 1700000000, nil
+}
+
+func (m *mockBlockchainClient) BlockHeader(ctx context.Context, blockNumber uint64) (*blockchain.BlockHeader, error) {
+	if m.failBlockHeader {
+		return nil, fmt.Errorf("simulated RPC block header error")
+	}
+	if m.blockHeaders != nil {
+		if h, ok := m.blockHeaders[blockNumber]; ok {
+			return h, nil
+		}
+	}
+	return &blockchain.BlockHeader{
+		Number:     blockNumber,
+		Hash:       common.HexToHash(fmt.Sprintf("0x%064x", blockNumber)),
+		ParentHash: common.HexToHash(fmt.Sprintf("0x%064x", blockNumber-1)),
+		Timestamp:  1700000000 + blockNumber,
+	}, nil
 }
 
 func (m *mockBlockchainClient) Close() {}
@@ -182,13 +201,22 @@ func TestTokenIndexer_BoundedRangeAndCheckpoint(t *testing.T) {
 		t.Fatalf("expected 1 transfer indexed, got %d", count)
 	}
 
-	// 2. Verify durable checkpoint advanced to 149
+	// 2. Verify durable checkpoint advanced to 149 with real block hash
 	checkpoint, found, err := db.GetCheckpoint(ctx, chainID, streamID)
 	if err != nil {
 		t.Fatalf("failed to get checkpoint: %v", err)
 	}
 	if !found || checkpoint != 149 {
 		t.Fatalf("expected checkpoint 149, got %d (found=%t)", checkpoint, found)
+	}
+
+	cpRecord, found, err := db.GetCheckpointWithHash(ctx, chainID, streamID)
+	if err != nil || !found || cpRecord == nil {
+		t.Fatalf("expected checkpoint with hash to be found, err: %v", err)
+	}
+	expectedHash149 := common.HexToHash(fmt.Sprintf("0x%064x", 149)).Hex()
+	if cpRecord.BlockNumber != 149 || cpRecord.BlockHash != expectedHash149 {
+		t.Fatalf("expected checkpoint 149 with hash %s, got block %d hash %s", expectedHash149, cpRecord.BlockNumber, cpRecord.BlockHash)
 	}
 
 	// 3. Process next batch: should resume from 150 to 195 (latest 200 - conf 5)
@@ -206,13 +234,22 @@ func TestTokenIndexer_BoundedRangeAndCheckpoint(t *testing.T) {
 		t.Fatalf("expected 0 transfers in empty range, got %d", count)
 	}
 
-	// 4. Verify checkpoint advanced to 195
+	// 4. Verify checkpoint advanced to 195 with real block hash
 	checkpoint, found, err = db.GetCheckpoint(ctx, chainID, streamID)
 	if err != nil {
 		t.Fatalf("failed to get checkpoint: %v", err)
 	}
 	if !found || checkpoint != 195 {
 		t.Fatalf("expected checkpoint 195, got %d", checkpoint)
+	}
+
+	cpRecord, found, err = db.GetCheckpointWithHash(ctx, chainID, streamID)
+	if err != nil || !found || cpRecord == nil {
+		t.Fatalf("expected checkpoint with hash to be found, err: %v", err)
+	}
+	expectedHash195 := common.HexToHash(fmt.Sprintf("0x%064x", 195)).Hex()
+	if cpRecord.BlockNumber != 195 || cpRecord.BlockHash != expectedHash195 {
+		t.Fatalf("expected checkpoint 195 with hash %s, got block %d hash %s", expectedHash195, cpRecord.BlockNumber, cpRecord.BlockHash)
 	}
 }
 
@@ -450,5 +487,69 @@ func TestTokenIndexer_GenericTokenSwitching(t *testing.T) {
 	}
 	if transfersFromDB_B[0].Token != tokenBAddr {
 		t.Fatalf("mismatched Token B in DB: %s", transfersFromDB_B[0].Token.Hex())
+	}
+}
+
+func TestTokenIndexer_BlockHeaderFailure_CheckpointDoesNotAdvance(t *testing.T) {
+	db := getTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	chainID := int64(11155111)
+	tokenAddr := common.HexToAddress("0xDDDD00000000000000000000000000000000DDDD")
+	streamID := fmt.Sprintf("test_stream_header_fail_%d", time.Now().UnixNano())
+
+	parsedABI, err := indexerABI.LoadERC20ABI("", `[
+		{
+			"anonymous": false,
+			"inputs": [
+				{"indexed": true, "name": "from", "type": "address"},
+				{"indexed": true, "name": "to", "type": "address"},
+				{"indexed": false, "name": "value", "type": "uint256"}
+			],
+			"name": "Transfer",
+			"type": "event"
+		}
+	]`)
+	if err != nil {
+		t.Fatalf("failed to load ABI: %v", err)
+	}
+
+	filterer, _ := indexerABI.NewGenericERC20Filterer(tokenAddr, parsedABI)
+	dec, _ := decoder.NewERC20Decoder(filterer)
+
+	mockClient := &mockBlockchainClient{
+		latestBlock:     200,
+		failBlockHeader: true, // Header retrieval fails
+		blockTimestamp:  1718000000,
+	}
+
+	indexerService, err := NewTokenIndexer(
+		mockClient,
+		dec,
+		db,
+		chainID,
+		100,
+		50,
+		5,
+		streamID,
+	)
+	if err != nil {
+		t.Fatalf("failed to create token indexer: %v", err)
+	}
+
+	// Attempt to index range 100..149: must fail because block header fails
+	_, err = indexerService.IndexRange(ctx, 100, 149)
+	if err == nil {
+		t.Fatal("expected error when block header retrieval fails, got nil")
+	}
+
+	// Verify checkpoint was NOT created or advanced
+	_, found, err := db.GetCheckpoint(ctx, chainID, streamID)
+	if err != nil {
+		t.Fatalf("failed to query checkpoint: %v", err)
+	}
+	if found {
+		t.Fatal("checkpoint must NOT advance when block header retrieval fails")
 	}
 }

@@ -189,7 +189,16 @@ func (s *Service) RunBackfill(ctx context.Context, opts BackfillOptions) (uint64
 			"count", len(events),
 		)
 
-		if err := s.persistence.SaveCheckpoint(ctx, opts.ChainID, opts.StreamID, to, ""); err != nil {
+		header, err := s.client.BlockHeader(ctx, to)
+		if err != nil {
+			slog.Error("Failed to fetch block header for checkpoint",
+				"block", to,
+				"error", err,
+			)
+			return lastIndexedBlock, fmt.Errorf("failed to fetch block header for block %d: %w", to, err)
+		}
+
+		if err := s.persistence.SaveCheckpoint(ctx, opts.ChainID, opts.StreamID, to, header.Hash.Hex()); err != nil {
 			slog.Error("Failed to update checkpoint",
 				"block", to,
 				"error", err,
@@ -199,6 +208,7 @@ func (s *Service) RunBackfill(ctx context.Context, opts BackfillOptions) (uint64
 
 		slog.Info("Checkpoint updated",
 			"block", to,
+			"hash", header.Hash.Hex(),
 		)
 
 		lastIndexedBlock = to

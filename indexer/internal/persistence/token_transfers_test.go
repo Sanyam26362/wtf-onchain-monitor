@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"os"
 	"testing"
@@ -197,38 +198,94 @@ func TestPersistence_SyncCheckpoint(t *testing.T) {
 
 	ctx := context.Background()
 	chainID := int64(11155111)
-	streamID := "test_stream_erc20_checkpoint"
+	streamID := fmt.Sprintf("test_stream_erc20_checkpoint_%d", time.Now().UnixNano())
 
 	// 1. Initial checkpoint: should be not found
 	_, found, err := pg.GetCheckpoint(ctx, chainID, streamID)
 	if err != nil {
 		t.Fatalf("failed to query initial checkpoint: %v", err)
 	}
+	if found {
+		t.Fatal("expected initial checkpoint to not be found")
+	}
 
-	// 2. Save checkpoint at block 100
-	if err := pg.SaveCheckpoint(ctx, chainID, streamID, 100, "0xhash100"); err != nil {
+	// 2. Save checkpoint at block 100 with real hash
+	hash100 := "0x1111111111111111111111111111111111111111111111111111111111111100"
+	if err := pg.SaveCheckpoint(ctx, chainID, streamID, 100, hash100); err != nil {
 		t.Fatalf("failed to save checkpoint: %v", err)
 	}
 
-	// 3. Verify retrieved block is 100
-	block, found, err := pg.GetCheckpoint(ctx, chainID, streamID)
+	// 3. Verify retrieved block and hash via GetCheckpointWithHash
+	cp, found, err := pg.GetCheckpointWithHash(ctx, chainID, streamID)
 	if err != nil {
-		t.Fatalf("failed to get checkpoint: %v", err)
+		t.Fatalf("failed to get checkpoint with hash: %v", err)
 	}
-	if !found || block != 100 {
-		t.Fatalf("expected checkpoint block 100, got %d (found=%t)", block, found)
+	if !found || cp == nil {
+		t.Fatalf("expected checkpoint to be found")
+	}
+	if cp.BlockNumber != 100 {
+		t.Errorf("expected checkpoint block 100, got %d", cp.BlockNumber)
+	}
+	if cp.BlockHash != hash100 {
+		t.Errorf("expected checkpoint hash %s, got %s", hash100, cp.BlockHash)
 	}
 
-	// 4. Advance checkpoint to block 150
-	if err := pg.SaveCheckpoint(ctx, chainID, streamID, 150, "0xhash150"); err != nil {
+	// 4. Advance checkpoint to block 150 with new hash
+	hash150 := "0x2222222222222222222222222222222222222222222222222222222222222150"
+	if err := pg.SaveCheckpoint(ctx, chainID, streamID, 150, hash150); err != nil {
 		t.Fatalf("failed to advance checkpoint: %v", err)
 	}
 
-	block, found, err = pg.GetCheckpoint(ctx, chainID, streamID)
+	cp, found, err = pg.GetCheckpointWithHash(ctx, chainID, streamID)
 	if err != nil {
 		t.Fatalf("failed to get advanced checkpoint: %v", err)
 	}
-	if !found || block != 150 {
-		t.Fatalf("expected advanced checkpoint block 150, got %d", block)
+	if !found || cp == nil {
+		t.Fatalf("expected advanced checkpoint to be found")
+	}
+	if cp.BlockNumber != 150 {
+		t.Errorf("expected advanced checkpoint block 150, got %d", cp.BlockNumber)
+	}
+	if cp.BlockHash != hash150 {
+		t.Errorf("expected advanced checkpoint hash %s, got %s", hash150, cp.BlockHash)
+	}
+}
+
+func TestPersistence_SaveTokenBatch_StoresBlockHash(t *testing.T) {
+	pg := getTestPostgres(t)
+	defer pg.Close()
+
+	ctx := context.Background()
+	chainID := int64(11155111)
+	streamID := fmt.Sprintf("test_stream_batch_hash_%d", time.Now().UnixNano())
+	checkpointBlock := uint64(7000000)
+	checkpointHash := "0x3333333333333333333333333333333333333333333333333333333333337000"
+
+	err := pg.SaveTokenBatch(
+		ctx,
+		chainID,
+		streamID,
+		nil,
+		nil,
+		nil,
+		checkpointBlock,
+		checkpointHash,
+	)
+	if err != nil {
+		t.Fatalf("SaveTokenBatch failed: %v", err)
+	}
+
+	cp, found, err := pg.GetCheckpointWithHash(ctx, chainID, streamID)
+	if err != nil {
+		t.Fatalf("failed to get checkpoint: %v", err)
+	}
+	if !found || cp == nil {
+		t.Fatal("expected checkpoint to exist after SaveTokenBatch")
+	}
+	if cp.BlockNumber != checkpointBlock {
+		t.Errorf("expected block number %d, got %d", checkpointBlock, cp.BlockNumber)
+	}
+	if cp.BlockHash != checkpointHash {
+		t.Errorf("expected block hash %s, got %s", checkpointHash, cp.BlockHash)
 	}
 }

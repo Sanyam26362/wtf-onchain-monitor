@@ -17,19 +17,21 @@ import (
 
 // mockPayrollPersistence implements PayrollPersistence for unit testing
 type mockPayrollPersistence struct {
-	checkpoints     map[string]uint64
-	transactions    []*blockchain.TransactionMetadata
-	chainEvents     []*decoder.DecodedEvent
-	projectedEvents []*decoder.DecodedEvent
-	failCheckpoint  bool
-	failTx          bool
-	failChainEvent  bool
-	failProject     bool
+	checkpoints      map[string]uint64
+	transactions     []*blockchain.TransactionMetadata
+	chainEvents      []*decoder.DecodedEvent
+	projectedEvents  []*decoder.DecodedEvent
+	failCheckpoint   bool
+	failTx           bool
+	failChainEvent   bool
+	failProject      bool
+	checkpointHashes map[string]string
 }
 
 func newMockPayrollPersistence() *mockPayrollPersistence {
 	return &mockPayrollPersistence{
-		checkpoints: make(map[string]uint64),
+		checkpoints:      make(map[string]uint64),
+		checkpointHashes: make(map[string]string),
 	}
 }
 
@@ -45,6 +47,7 @@ func (m *mockPayrollPersistence) SaveCheckpoint(ctx context.Context, chainID int
 	}
 	key := fmt.Sprintf("%d:%s", chainID, streamID)
 	m.checkpoints[key] = blockNumber
+	m.checkpointHashes[key] = blockHash
 	return nil
 }
 
@@ -74,10 +77,12 @@ func (m *mockPayrollPersistence) ProjectPayrollEvent(ctx context.Context, chainI
 
 // mockPayrollClient implements blockchain.BlockchainClient for payroll tests
 type mockPayrollClient struct {
-	latestBlock uint64
-	logs        []types.Log
-	failGetLogs bool
-	failBlock   bool
+	latestBlock     uint64
+	logs            []types.Log
+	failGetLogs     bool
+	failBlock       bool
+	failBlockHeader bool
+	blockHeaders    map[uint64]*blockchain.BlockHeader
 }
 
 func (m *mockPayrollClient) LatestBlock(ctx context.Context) (uint64, error) {
@@ -116,6 +121,23 @@ func (m *mockPayrollClient) TransactionMetadata(ctx context.Context, txHash comm
 
 func (m *mockPayrollClient) BlockTimestamp(ctx context.Context, blockNumber uint64) (uint64, error) {
 	return 1700000000, nil
+}
+
+func (m *mockPayrollClient) BlockHeader(ctx context.Context, blockNumber uint64) (*blockchain.BlockHeader, error) {
+	if m.failBlockHeader {
+		return nil, fmt.Errorf("simulated block header failure")
+	}
+	if m.blockHeaders != nil {
+		if h, ok := m.blockHeaders[blockNumber]; ok {
+			return h, nil
+		}
+	}
+	return &blockchain.BlockHeader{
+		Number:     blockNumber,
+		Hash:       common.HexToHash(fmt.Sprintf("0x%064x", blockNumber)),
+		ParentHash: common.HexToHash(fmt.Sprintf("0x%064x", blockNumber-1)),
+		Timestamp:  1700000000 + blockNumber,
+	}, nil
 }
 
 func (m *mockPayrollClient) Close() {}
@@ -162,13 +184,19 @@ func TestPayroll_MultipleHistoricalRangesAndPartialRange(t *testing.T) {
 		t.Fatalf("expected lastIndexedBlock 215, got %d", lastIndexed)
 	}
 
-	// Verify checkpoint was updated to target block
+	// Verify checkpoint was updated to target block and real hash was stored
 	cp, found, err := mockDB.GetCheckpoint(ctx, opts.ChainID, opts.StreamID)
 	if err != nil || !found {
 		t.Fatalf("expected checkpoint to be found, got err: %v", err)
 	}
 	if cp != 215 {
 		t.Fatalf("expected checkpoint block 215, got %d", cp)
+	}
+
+	key := fmt.Sprintf("%d:%s", opts.ChainID, opts.StreamID)
+	expectedHash215 := common.HexToHash(fmt.Sprintf("0x%064x", 215)).Hex()
+	if mockDB.checkpointHashes[key] != expectedHash215 {
+		t.Fatalf("expected checkpoint hash %s, got %s", expectedHash215, mockDB.checkpointHashes[key])
 	}
 }
 
@@ -396,5 +424,45 @@ func TestPayroll_EmployeeAddedAndRemovedDecodingAndProjection(t *testing.T) {
 	}
 	if len(mockDB.projectedEvents) != 1 {
 		t.Fatalf("expected 1 projected event, got %d", len(mockDB.projectedEvents))
+	}
+}
+
+func TestPayroll_BlockHeaderFailure_CheckpointDoesNotAdvance(t *testing.T) {
+	ctx := context.Background()
+	mockClient := &mockPayrollClient{
+		latestBlock:     500,
+		failBlockHeader: true, // Header retrieval fails
+	}
+	mockDB := newMockPayrollPersistence()
+
+	payrollAddr := common.HexToAddress("0x25a2aa23067B7cF5a991fC56cF76E8BFE03Cc6eC")
+	dec, err := decoder.New(payrollAddr)
+	if err != nil {
+		t.Fatalf("failed to create decoder: %v", err)
+	}
+
+	svc, err := NewWithDecoder(mockClient, dec, mockDB)
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	opts := BackfillOptions{
+		ChainID:         11155111,
+		ContractAddress: payrollAddr,
+		StartBlock:      100,
+		TargetBlock:     150,
+		BatchSize:       50,
+		StreamID:        "monthly_payroll",
+	}
+
+	_, err = svc.RunBackfill(ctx, opts)
+	if err == nil {
+		t.Fatal("expected backfill error when BlockHeader fails, got nil")
+	}
+
+	// Verify checkpoint was NOT updated
+	_, found, _ := mockDB.GetCheckpoint(ctx, opts.ChainID, opts.StreamID)
+	if found {
+		t.Fatal("expected checkpoint to NOT be advanced when BlockHeader fails")
 	}
 }
