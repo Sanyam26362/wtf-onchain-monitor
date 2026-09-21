@@ -102,7 +102,7 @@ func main() {
 	}
 	if cfg.PayrollContractAddress != "" {
 		fmt.Printf("Payroll Contract:        %s\n", cfg.PayrollContractAddress)
-		fmt.Printf("Payroll Start Block:     %d\n", startBlock)
+		fmt.Printf("Payroll Start Block:     %d  (from START_BLOCK)\n", startBlock)
 		fmt.Printf("Payroll Stream ID:       %s\n", cfg.PayrollStreamID)
 	}
 	if cfg.TokenAddress != "" {
