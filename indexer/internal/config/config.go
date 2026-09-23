@@ -55,8 +55,18 @@ type Config struct {
 	ReconciliationTokenStreamID       string
 	ReconciliationTokenBalanceStreamID string
 
+	// Redis & Webhook / Escrow Configuration
+	RedisURL                 string
+	AlchemyWebhookSigningKey string
+	WTFEscrowContractAddress string
+
 	// ParsedTokenABI is populated and cached after successful validation.
 	ParsedTokenABI *abi.ABI
+}
+
+// LoadConfig loads the indexer configuration from environment variables.
+func LoadConfig() (Config, error) {
+	return Load()
 }
 
 func Load() (Config, error) {
@@ -119,9 +129,12 @@ func Load() (Config, error) {
 		}
 	}
 
-	rpcURL, err := getRequired("RPC_URL")
-	if err != nil {
-		return Config{}, err
+	rpcURL := os.Getenv("RPC_URL")
+	if rpcURL == "" {
+		rpcURL = os.Getenv("SEPOLIA_RPC_URL")
+	}
+	if rpcURL == "" {
+		return Config{}, fmt.Errorf("missing required environment variable: RPC_URL or SEPOLIA_RPC_URL")
 	}
 
 	dbURL, err := getRequired("DATABASE_URL")
@@ -129,9 +142,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	env, err := getRequired("DEPLOYMENT_ENVIRONMENT")
-	if err != nil {
-		return Config{}, err
+	env := os.Getenv("DEPLOYMENT_ENVIRONMENT")
+	if env == "" {
+		env = os.Getenv("APP_ENV")
+	}
+	if env == "" {
+		return Config{}, fmt.Errorf("missing required environment variable: DEPLOYMENT_ENVIRONMENT or APP_ENV")
 	}
 
 	payrollContract := os.Getenv("PAYROLL_CONTRACT_ADDRESS")
@@ -177,6 +193,10 @@ func Load() (Config, error) {
 
 	apiPort := 8080
 	if val := os.Getenv("API_PORT"); val != "" {
+		if p, err := strconv.Atoi(val); err == nil && p > 0 {
+			apiPort = p
+		}
+	} else if val := os.Getenv("PORT"); val != "" {
 		if p, err := strconv.Atoi(val); err == nil && p > 0 {
 			apiPort = p
 		}
@@ -280,6 +300,21 @@ func Load() (Config, error) {
 		}
 	}
 
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "localhost:6379"
+	}
+
+	alchemyWebhookSigningKey := os.Getenv("ALCHEMY_WEBHOOK_SIGNING_KEY")
+	if alchemyWebhookSigningKey == "" {
+		alchemyWebhookSigningKey = "whsec_test_dummy_key"
+	}
+
+	wtfEscrowContractAddress := os.Getenv("WTF_ESCROW_CONTRACT_ADDRESS")
+	if wtfEscrowContractAddress == "" {
+		wtfEscrowContractAddress = "0x0000000000000000000000000000000000000000"
+	}
+
 	cfg := Config{
 		ChainID:                           chainID,
 		RPCURL:                            rpcURL,
@@ -315,6 +350,9 @@ func Load() (Config, error) {
 		ReconciliationSalaryClaimStreamID: reconSalaryClaimStreamID,
 		ReconciliationTokenStreamID:       reconTokenStreamID,
 		ReconciliationTokenBalanceStreamID: reconTokenBalanceStreamID,
+		RedisURL:                          redisURL,
+		AlchemyWebhookSigningKey:          alchemyWebhookSigningKey,
+		WTFEscrowContractAddress:          wtfEscrowContractAddress,
 	}
 
 	return cfg, nil

@@ -289,3 +289,50 @@ func TestLoad_ReconciliationConfig(t *testing.T) {
 		t.Errorf("expected ReconciliationStreamID 'recon_test_stream', got %q", cfg.ReconciliationStreamID)
 	}
 }
+
+func TestLoad_RedisAndEscrowConfig(t *testing.T) {
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11080692")
+	t.Setenv("CONFIRMATIONS", "5")
+	t.Setenv("POLLING_INTERVAL", "5s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+
+	// Test defaults
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config with LoadConfig(): %v", err)
+	}
+
+	if cfg.RedisURL != "localhost:6379" {
+		t.Errorf("expected default RedisURL 'localhost:6379', got %q", cfg.RedisURL)
+	}
+	if cfg.AlchemyWebhookSigningKey != "whsec_test_dummy_key" {
+		t.Errorf("expected default AlchemyWebhookSigningKey 'whsec_test_dummy_key', got %q", cfg.AlchemyWebhookSigningKey)
+	}
+	if cfg.WTFEscrowContractAddress != "0x0000000000000000000000000000000000000000" {
+		t.Errorf("expected default WTFEscrowContractAddress '0x0000000000000000000000000000000000000000', got %q", cfg.WTFEscrowContractAddress)
+	}
+
+	// Test custom values
+	t.Setenv("REDIS_URL", "redis-custom:6380")
+	t.Setenv("ALCHEMY_WEBHOOK_SIGNING_KEY", "whsec_custom_secret_123")
+	t.Setenv("WTF_ESCROW_CONTRACT_ADDRESS", "0x1111111111111111111111111111111111111111")
+
+	cfgCustom, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading custom config: %v", err)
+	}
+
+	if cfgCustom.RedisURL != "redis-custom:6380" {
+		t.Errorf("expected custom RedisURL 'redis-custom:6380', got %q", cfgCustom.RedisURL)
+	}
+	if cfgCustom.AlchemyWebhookSigningKey != "whsec_custom_secret_123" {
+		t.Errorf("expected custom AlchemyWebhookSigningKey 'whsec_custom_secret_123', got %q", cfgCustom.AlchemyWebhookSigningKey)
+	}
+	if cfgCustom.WTFEscrowContractAddress != "0x1111111111111111111111111111111111111111" {
+		t.Errorf("expected custom WTFEscrowContractAddress '0x1111111111111111111111111111111111111111', got %q", cfgCustom.WTFEscrowContractAddress)
+	}
+}
+

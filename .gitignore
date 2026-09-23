@@ -4,4 +4,6 @@ bin/
 .DS_Store
 .env
 *.env
+indexer/.env
 !.env.example
+!indexer/.env.example
