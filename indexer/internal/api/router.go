@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"worldtradefuture/indexer/internal/api/handlers"
 	"worldtradefuture/indexer/internal/api/middleware"
@@ -13,8 +14,13 @@ import (
 )
 
 // NewRouter sets up all endpoints and middleware for the REST API.
-func NewRouter(pool *pgxpool.Pool, cfg *config.Config, logger *slog.Logger) http.Handler {
+func NewRouter(pool *pgxpool.Pool, cfg *config.Config, logger *slog.Logger, redisClient ...*redis.Client) http.Handler {
 	mux := http.NewServeMux()
+
+	var rdb *redis.Client
+	if len(redisClient) > 0 {
+		rdb = redisClient[0]
+	}
 
 	// Initialize repositories
 	txRepo := repository.NewTransactionsRepository(pool)
@@ -24,6 +30,11 @@ func NewRouter(pool *pgxpool.Pool, cfg *config.Config, logger *slog.Logger) http
 	tokensRepo := repository.NewTokensRepository(pool)
 	syncRepo := repository.NewSyncRepository(pool)
 	recRepo := repository.NewReconciliationRepository(pool)
+	chainEventsRepo := repository.NewChainEventsRepository(pool)
+
+	// Webhook handler (Alchemy Notify)
+	webhookHandler := handlers.NewWebhookHandler(cfg, chainEventsRepo, rdb)
+	mux.HandleFunc("POST /api/indexer/webhook", webhookHandler.HandleAlchemyWebhook)
 
 	// System & Health endpoints
 	mux.HandleFunc("GET /health", handlers.HealthHandler())

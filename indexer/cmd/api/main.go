@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 
 	"worldtradefuture/indexer/internal/api"
 	"worldtradefuture/indexer/internal/config"
@@ -57,7 +58,21 @@ func main() {
 		}
 	}
 
-	router := api.NewRouter(db.Pool(), &cfg, logger)
+	var rdb *redis.Client
+	if cfg.RedisURL != "" {
+		redisCtx, redisCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var redisErr error
+		rdb, redisErr = persistence.NewRedisClient(redisCtx, cfg.RedisURL, "", 0)
+		redisCancel()
+		if redisErr != nil {
+			logger.Warn("redis connection not established, running without redis cache/pubsub", "error", redisErr.Error())
+		} else {
+			defer rdb.Close()
+			logger.Info("connected to redis", "url", cfg.RedisURL)
+		}
+	}
+
+	router := api.NewRouter(db.Pool(), &cfg, logger, rdb)
 
 	addr := fmt.Sprintf("%s:%d", cfg.APIHost, cfg.APIPort)
 	server := &http.Server{
