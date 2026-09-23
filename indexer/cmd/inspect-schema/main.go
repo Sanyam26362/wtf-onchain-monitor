@@ -20,6 +20,17 @@ func main() {
 		log.Fatal(err)
 	}
 	defer pg.Close()
+
+	migrationsDir := "./migrations"
+	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
+		migrationsDir = "../../migrations"
+	}
+	if _, err := os.Stat(migrationsDir); err == nil {
+		if err := pg.RunMigrations(ctx, migrationsDir); err != nil {
+			log.Fatalf("failed to run migrations: %v", err)
+		}
+	}
+
 	pool := pg.Pool()
 	schema := pg.Schema()
 

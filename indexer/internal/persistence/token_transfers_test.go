@@ -9,15 +9,17 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/joho/godotenv"
 
 	"worldtradefuture/indexer/internal/blockchain"
 	"worldtradefuture/indexer/internal/models"
 )
 
 func getTestPostgres(t *testing.T) *Postgres {
+	_ = godotenv.Load("../../.env")
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:root@localhost:5432/wtf_onchain"
+		dbURL = "postgres://wtf_user:wtf_password@localhost:5433/wtf_indexer?sslmode=disable"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

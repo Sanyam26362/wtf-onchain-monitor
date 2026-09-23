@@ -407,7 +407,7 @@ func TestTokenIndexer_GenericTokenSwitching(t *testing.T) {
 		}
 
 		packed, _ := parsedABI.Events["Transfer"].Inputs.NonIndexed().Pack(big.NewInt(42000))
-		txHash := common.HexToHash("0x1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff")
+		txHash := common.HexToHash(fmt.Sprintf("0x111122223333444455556666777788889999%08x%08x", blockNum, time.Now().UnixNano()%100000000))
 
 		mockClient := &mockBlockchainClient{
 			latestBlock: blockNum + 10,
