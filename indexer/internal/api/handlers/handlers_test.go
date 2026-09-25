@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,24 +138,26 @@ func TestSyncBackfillHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("valid backfill request", func(t *testing.T) {
+	t.Run("valid backfill request returns 501 Not Implemented", func(t *testing.T) {
 		payload := `{"from_block": 11714400, "to_block": 11714450, "stream_id": "erc20_transfers"}`
 		req := httptest.NewRequest(http.MethodPost, "/v1/sync/backfill", bytes.NewBufferString(payload))
 		rec := httptest.NewRecorder()
 
 		handler.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusAccepted {
-			t.Fatalf("expected 202 Accepted, got: %d", rec.Code)
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("expected 501 Not Implemented, got: %d", rec.Code)
 		}
 
-		var env responses.SuccessEnvelope
+		var env responses.ErrorEnvelope
 		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
-		data := env.Data.(map[string]any)
-		if data["status"] != "accepted" {
-			t.Fatalf("expected accepted status, got: %v", data["status"])
+		if env.Error.Code != responses.ErrCodeNotImplemented {
+			t.Fatalf("expected error code %s, got: %s", responses.ErrCodeNotImplemented, env.Error.Code)
+		}
+		if !strings.Contains(env.Error.Message, "cmd/indexer --stream=escrow") {
+			t.Fatalf("expected message to mention cmd/indexer CLI, got: %s", env.Error.Message)
 		}
 	})
 }
