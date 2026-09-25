@@ -187,8 +187,12 @@ func (ei *EscrowIndexer) IndexRange(ctx context.Context, fromBlock, toBlock uint
 				"amount":    amount,
 			}
 			if msgBytes, err := json.Marshal(payload); err == nil {
-				_ = ei.redis.Publish(ctx, "wtf:chain:events", msgBytes).Err()
-				_ = ei.redis.Publish(ctx, "wtf:chain:settled", msgBytes).Err()
+				if err := ei.redis.Publish(ctx, "wtf:chain:events", msgBytes).Err(); err != nil {
+					slog.Warn("failed to publish escrow event to redis", "channel", "wtf:chain:events", "error", err)
+				}
+				if err := ei.redis.Publish(ctx, "wtf:chain:settled", msgBytes).Err(); err != nil {
+					slog.Warn("failed to publish escrow event to redis", "channel", "wtf:chain:settled", "error", err)
+				}
 			}
 		}
 	}
