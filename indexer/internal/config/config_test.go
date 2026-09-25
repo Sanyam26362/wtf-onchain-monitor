@@ -180,7 +180,7 @@ func TestLoad_BackfillToBlock(t *testing.T) {
 	t.Setenv("POLLING_INTERVAL", "12s")
 	t.Setenv("RPC_URL", "https://sepolia.example.com")
 	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
-	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "development")
 
 	cfg, err := Load()
 	if err != nil {
@@ -205,7 +205,7 @@ func TestLoad_LiveMonitoringConfig(t *testing.T) {
 	t.Setenv("LIVE_POLL_INTERVAL", "3s")
 	t.Setenv("RPC_URL", "https://sepolia.example.com")
 	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
-	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "development")
 
 	cfg, err := Load()
 	if err != nil {
@@ -233,7 +233,7 @@ func TestLoad_RPCRetryConfig(t *testing.T) {
 	t.Setenv("POLLING_INTERVAL", "5s")
 	t.Setenv("RPC_URL", "https://sepolia.example.com")
 	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
-	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "development")
 	t.Setenv("RPC_MAX_RETRIES", "7")
 	t.Setenv("RPC_INITIAL_BACKOFF", "2s")
 	t.Setenv("RPC_MAX_BACKOFF", "45s")
@@ -265,7 +265,7 @@ func TestLoad_ReconciliationConfig(t *testing.T) {
 	t.Setenv("POLLING_INTERVAL", "5s")
 	t.Setenv("RPC_URL", "https://sepolia.example.com")
 	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
-	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "development")
 	t.Setenv("RECONCILIATION_ENABLED", "true")
 	t.Setenv("RECONCILIATION_BLOCK_WINDOW", "1000")
 	t.Setenv("RECONCILIATION_INTERVAL", "15s")
@@ -297,7 +297,7 @@ func TestLoad_RedisAndEscrowConfig(t *testing.T) {
 	t.Setenv("POLLING_INTERVAL", "5s")
 	t.Setenv("RPC_URL", "https://sepolia.example.com")
 	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
-	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "development")
 
 	// Test defaults
 	cfg, err := LoadConfig()
@@ -378,7 +378,7 @@ func TestPayrollStreamID_AddressScoped(t *testing.T) {
 	t.Setenv("POLLING_INTERVAL", "5s")
 	t.Setenv("RPC_URL", "https://sepolia.example.com")
 	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
-	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "development")
 	t.Setenv("PAYROLL_CONTRACT_ADDRESS", newContract)
 	t.Setenv("PAYROLL_STREAM_ID", "")
 
@@ -428,7 +428,7 @@ func TestTokenStreamID_Unchanged(t *testing.T) {
 	t.Setenv("POLLING_INTERVAL", "5s")
 	t.Setenv("RPC_URL", "https://sepolia.example.com")
 	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
-	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "development")
 	t.Setenv("TOKEN_ADDRESS", tokenAddr)
 	t.Setenv("TOKEN_STREAM_ID", "")
 
@@ -449,5 +449,48 @@ func TestTokenStreamID_Unchanged(t *testing.T) {
 		t.Fatalf("cfg.TokenStreamID = %q, want custom_token_stream", cfg.TokenStreamID)
 	}
 }
+
+func TestLoad_SigningKeyValidation_NonDevelopment(t *testing.T) {
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11080692")
+	t.Setenv("CONFIRMATIONS", "5")
+	t.Setenv("POLLING_INTERVAL", "5s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "production")
+
+	// Missing signing key in production fails
+	t.Setenv("ALCHEMY_WEBHOOK_SIGNING_KEY", "")
+	_, err := LoadConfig()
+	if err == nil || !strings.Contains(err.Error(), "ALCHEMY_WEBHOOK_SIGNING_KEY is required in non-development environments") {
+		t.Fatalf("expected error for missing signing key in production, got: %v", err)
+	}
+
+	// Default dummy signing key in production fails
+	t.Setenv("ALCHEMY_WEBHOOK_SIGNING_KEY", "whsec_test_dummy_key")
+	_, err = LoadConfig()
+	if err == nil || !strings.Contains(err.Error(), "ALCHEMY_WEBHOOK_SIGNING_KEY is required in non-development environments") {
+		t.Fatalf("expected error for dummy signing key in production, got: %v", err)
+	}
+
+	// Valid signing key in production succeeds
+	t.Setenv("ALCHEMY_WEBHOOK_SIGNING_KEY", "whsec_prod_secret_valid_999")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error with valid signing key in production: %v", err)
+	}
+	if cfg.AlchemyWebhookSigningKey != "whsec_prod_secret_valid_999" {
+		t.Errorf("expected signing key to be set, got %q", cfg.AlchemyWebhookSigningKey)
+	}
+
+	// Also verify ENVIRONMENT env var directly triggers validation
+	t.Setenv("ENVIRONMENT", "staging")
+	t.Setenv("ALCHEMY_WEBHOOK_SIGNING_KEY", "")
+	_, err = LoadConfig()
+	if err == nil || !strings.Contains(err.Error(), "ALCHEMY_WEBHOOK_SIGNING_KEY is required in non-development environments") {
+		t.Fatalf("expected error for missing signing key in staging via ENVIRONMENT, got: %v", err)
+	}
+}
+
 
 
