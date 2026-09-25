@@ -41,6 +41,7 @@ type AlchemyLog struct {
 	Account          struct {
 		Address string `json:"address"`
 	} `json:"account"`
+	Removed bool `json:"removed"`
 }
 
 // ChainSettledMessage is the event broadcast payload published to Redis Pub/Sub channel wtf:chain:settled.
