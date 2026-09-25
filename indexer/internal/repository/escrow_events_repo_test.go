@@ -45,7 +45,7 @@ func TestEscrowEventsRepository_CRUD(t *testing.T) {
 
 	ctx := context.Background()
 	nonce := time.Now().UnixNano()
-	txHash := common.HexToHash("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+	txHash := common.HexToHash(fmt.Sprintf("0x%016x%016x%016x%016x", nonce, nonce, nonce, nonce))
 	contractAddr := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	escrowID := fmt.Sprintf("%d", nonce)
 	amount := "1000000000"
