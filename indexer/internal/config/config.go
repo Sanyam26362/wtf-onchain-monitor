@@ -58,7 +58,10 @@ type Config struct {
 	// Redis & Webhook / Escrow Configuration
 	RedisURL                 string
 	AlchemyWebhookSigningKey string
+	EscrowContractAddress    string
 	WTFEscrowContractAddress string
+	EscrowStartBlock         uint64
+	EscrowStreamID           string
 
 	// ParsedTokenABI is populated and cached after successful validation.
 	ParsedTokenABI *abi.ABI
@@ -162,7 +165,9 @@ func Load() (Config, error) {
 	}
 
 	payrollStreamID := os.Getenv("PAYROLL_STREAM_ID")
-	if payrollStreamID == "" {
+	if (payrollStreamID == "" || payrollStreamID == "monthly_payroll") && payrollContract != "" {
+		payrollStreamID = PayrollStreamID(payrollContract)
+	} else if payrollStreamID == "" {
 		payrollStreamID = "monthly_payroll"
 	}
 
@@ -310,9 +315,23 @@ func Load() (Config, error) {
 		alchemyWebhookSigningKey = "whsec_test_dummy_key"
 	}
 
-	wtfEscrowContractAddress := os.Getenv("WTF_ESCROW_CONTRACT_ADDRESS")
-	if wtfEscrowContractAddress == "" {
-		wtfEscrowContractAddress = "0x0000000000000000000000000000000000000000"
+	escrowContract := os.Getenv("ESCROW_CONTRACT_ADDRESS")
+	if escrowContract == "" {
+		escrowContract = os.Getenv("WTF_ESCROW_CONTRACT_ADDRESS")
+	}
+
+	escrowStartBlock := uint64(0)
+	if val := os.Getenv("ESCROW_START_BLOCK"); val != "" {
+		parsed, parseErr := strconv.ParseUint(val, 10, 64)
+		if parseErr != nil {
+			return Config{}, fmt.Errorf("invalid ESCROW_START_BLOCK: %w", parseErr)
+		}
+		escrowStartBlock = parsed
+	}
+
+	escrowStreamID := os.Getenv("ESCROW_STREAM_ID")
+	if escrowStreamID == "" {
+		escrowStreamID = "wtf_escrow"
 	}
 
 	cfg := Config{
@@ -352,7 +371,10 @@ func Load() (Config, error) {
 		ReconciliationTokenBalanceStreamID: reconTokenBalanceStreamID,
 		RedisURL:                          redisURL,
 		AlchemyWebhookSigningKey:          alchemyWebhookSigningKey,
-		WTFEscrowContractAddress:          wtfEscrowContractAddress,
+		EscrowContractAddress:             escrowContract,
+		WTFEscrowContractAddress:          escrowContract,
+		EscrowStartBlock:                  escrowStartBlock,
+		EscrowStreamID:                    escrowStreamID,
 	}
 
 	return cfg, nil
@@ -470,4 +492,13 @@ func getUint64(key string) (uint64, error) {
 	}
 
 	return result, nil
+}
+
+// PayrollStreamID returns the address-scoped stream ID for a payroll contract.
+// If contractAddress is empty, it returns the legacy default "monthly_payroll".
+func PayrollStreamID(contractAddress string) string {
+	if contractAddress == "" {
+		return "monthly_payroll"
+	}
+	return fmt.Sprintf("monthly_payroll_%s", strings.ToLower(contractAddress))
 }
