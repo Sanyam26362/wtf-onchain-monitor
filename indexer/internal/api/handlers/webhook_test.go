@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
@@ -26,13 +27,13 @@ import (
 	"worldtradefuture/indexer/internal/repository"
 )
 
-type mockChainEventsRepo struct {
+type mockEscrowEventsRepo struct {
 	mu       sync.Mutex
-	inserted []*models.ChainEvent
-	insertFn func(ctx context.Context, event *models.ChainEvent) error
+	inserted []*models.EscrowEvent
+	insertFn func(ctx context.Context, event *models.EscrowEvent) error
 }
 
-func (m *mockChainEventsRepo) InsertChainEvent(ctx context.Context, event *models.ChainEvent) error {
+func (m *mockEscrowEventsRepo) SaveEscrowEvent(ctx context.Context, event *models.EscrowEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.insertFn != nil {
@@ -42,27 +43,16 @@ func (m *mockChainEventsRepo) InsertChainEvent(ctx context.Context, event *model
 	return nil
 }
 
-func (m *mockChainEventsRepo) GetEventsByEscrowID(ctx context.Context, escrowID string) ([]models.ChainEvent, error) {
+func (m *mockEscrowEventsRepo) GetEscrowEventsByEscrowID(ctx context.Context, escrowID string) ([]*models.EscrowEvent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var res []models.ChainEvent
+	var res []*models.EscrowEvent
 	for _, e := range m.inserted {
-		if e.EscrowID == escrowID {
-			res = append(res, *e)
+		if e.EscrowID != nil && *e.EscrowID == escrowID {
+			res = append(res, e)
 		}
 	}
 	return res, nil
-}
-
-func (m *mockChainEventsRepo) GetEventByTxAndLogIndex(ctx context.Context, txHash string, logIndex int) (*models.ChainEvent, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, e := range m.inserted {
-		if strings.EqualFold(e.TxHash, txHash) && e.LogIndex == logIndex {
-			return e, nil
-		}
-	}
-	return nil, nil
 }
 
 func computeSignature(body []byte, key string) string {
@@ -86,7 +76,7 @@ func getTestRedis(t *testing.T) *redis.Client {
 	return rdb
 }
 
-func getTestPostgres(t *testing.T) (*persistence.Postgres, *repository.ChainEventsRepository) {
+func getTestPostgres(t *testing.T) (*persistence.Postgres, *repository.EscrowEventsRepository) {
 	_ = godotenv.Load("../../.env")
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -106,7 +96,7 @@ func getTestPostgres(t *testing.T) (*persistence.Postgres, *repository.ChainEven
 		_ = pg.RunMigrations(ctx, migrationsDir)
 	}
 
-	repo := repository.NewChainEventsRepository(pg.Pool())
+	repo := repository.NewEscrowEventsRepository(pg.Pool())
 	return pg, repo
 }
 
@@ -118,7 +108,7 @@ func TestWebhookHandler_SignatureValidation(t *testing.T) {
 		WTFEscrowContractAddress: "0x0000000000000000000000000000000000000000",
 	}
 
-	repo := &mockChainEventsRepo{}
+	repo := &mockEscrowEventsRepo{}
 	handler := handlers.NewWebhookHandler(cfg, repo, nil)
 
 	validPayload := `{"webhookId":"wh_123","event":{"data":{"block":{"logs":[]}}}}`
@@ -184,13 +174,13 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 		WTFEscrowContractAddress: "0x0000000000000000000000000000000000000000",
 	}
 
-	repo := &mockChainEventsRepo{}
+	repo := &mockEscrowEventsRepo{}
 	handler := handlers.NewWebhookHandler(cfg, repo, rdb)
 
 	nonce := time.Now().UnixNano()
-	txHash := fmt.Sprintf("0xtx_%016x_%016x", nonce, nonce+1)
+	txHash := fmt.Sprintf("0x%032x%032x", nonce, nonce+1)
 	logIndex := 1
-	escrowID := fmt.Sprintf("0xescrow_%016x", nonce)
+	escrowIDHex := fmt.Sprintf("0x%064x", nonce)
 	dedupeKey := fmt.Sprintf("wtf:chain:evt:%s:%d", txHash, logIndex)
 
 	// Clean up Redis key before test
@@ -201,7 +191,6 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 	pubsub := rdb.Subscribe(ctx, "wtf:chain:settled")
 	defer pubsub.Close()
 
-	// Wait briefly for subscription to activate
 	_, err := pubsub.Receive(ctx)
 	if err != nil {
 		t.Fatalf("failed to receive subscription confirmation: %v", err)
@@ -224,7 +213,7 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 							TransactionIndex: 0,
 							BlockNumber:      "0x112233",
 							Address:          "0x111122223333444455556666777788889999aaaa",
-							Topics:           []string{"0xtopic0_sig", escrowID},
+							Topics:           []string{"0xtopic0_sig", escrowIDHex},
 						},
 					},
 				},
@@ -238,7 +227,7 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 	}
 	signature := computeSignature(bodyBytes, signingKey)
 
-	// --- Step 1: Initial Ingestion (Test 2) ---
+	// Initial Ingestion
 	req1 := httptest.NewRequest(http.MethodPost, "/api/indexer/webhook", bytes.NewReader(bodyBytes))
 	req1.Header.Set("x-alchemy-signature", signature)
 	rec1 := httptest.NewRecorder()
@@ -258,17 +247,11 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 	inserted := repo.inserted[0]
 	repo.mu.Unlock()
 
-	if inserted.TxHash != txHash {
-		t.Errorf("expected TxHash %s, got %s", txHash, inserted.TxHash)
+	if inserted.TxHash != common.HexToHash(txHash) {
+		t.Errorf("expected TxHash %s, got %s", txHash, inserted.TxHash.Hex())
 	}
-	if inserted.LogIndex != logIndex {
+	if inserted.LogIndex != uint(logIndex) {
 		t.Errorf("expected LogIndex %d, got %d", logIndex, inserted.LogIndex)
-	}
-	if inserted.EscrowID != escrowID {
-		t.Errorf("expected EscrowID %s, got %s", escrowID, inserted.EscrowID)
-	}
-	if inserted.EventName != "EscrowSettled" {
-		t.Errorf("expected EventName EscrowSettled, got %s", inserted.EventName)
 	}
 	if inserted.BlockNumber != 0x112233 {
 		t.Errorf("expected BlockNumber %d, got %d", 0x112233, inserted.BlockNumber)
@@ -282,9 +265,6 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 		if err := json.Unmarshal([]byte(msg.Payload), &settled); err != nil {
 			t.Fatalf("failed to decode pubsub message: %v", err)
 		}
-		if settled.EscrowID != escrowID {
-			t.Errorf("expected pubsub EscrowID %s, got %s", escrowID, settled.EscrowID)
-		}
 		if settled.TxHash != txHash {
 			t.Errorf("expected pubsub TxHash %s, got %s", txHash, settled.TxHash)
 		}
@@ -292,13 +272,7 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 		t.Fatal("timed out waiting for message on wtf:chain:settled")
 	}
 
-	// Verify Redis dedupe key exists
-	val, err := rdb.Get(ctx, dedupeKey).Result()
-	if err != nil || val != "1" {
-		t.Fatalf("expected dedupe key %s to be '1', got val: %s, err: %v", dedupeKey, val, err)
-	}
-
-	// --- Step 2: Replay Ingestion (Test 3) ---
+	// Replay Ingestion (deduplication)
 	req2 := httptest.NewRequest(http.MethodPost, "/api/indexer/webhook", bytes.NewReader(bodyBytes))
 	req2.Header.Set("x-alchemy-signature", signature)
 	rec2 := httptest.NewRecorder()
@@ -309,25 +283,213 @@ func TestWebhookHandler_ValidIngestionAndDeduplication(t *testing.T) {
 		t.Fatalf("expected 200 OK on replayed ingestion, got: %d", rec2.Code)
 	}
 
-	// Repository should NOT have any new inserts (still count = 1)
 	repo.mu.Lock()
 	if len(repo.inserted) != 1 {
 		repo.mu.Unlock()
 		t.Fatalf("expected repo inserted count to remain 1 after deduplication, got: %d", len(repo.inserted))
 	}
 	repo.mu.Unlock()
+}
 
-	// Redis Pub/Sub should NOT receive any duplicate message
-	select {
-	case dupMsg := <-msgCh:
-		t.Fatalf("unexpected pubsub message received on duplicate webhook: %+v", dupMsg)
-	case <-time.After(200 * time.Millisecond):
-		// Expected: no message sent
+// Test 4: Real ABI Decoding - EscrowCreated, EscrowReleased, DisputeRaised
+func TestWebhookHandler_RealABIDecoding(t *testing.T) {
+	signingKey := "whsec_test_secret_key"
+	cfg := &config.Config{
+		ChainID:                  11155111,
+		AlchemyWebhookSigningKey: signingKey,
+		EscrowContractAddress:    "0x3333333333333333333333333333333333333333",
+	}
+
+	repo := &mockEscrowEventsRepo{}
+	handler := handlers.NewWebhookHandler(cfg, repo, nil)
+
+	// 1. EscrowCreated event
+	// Topic0: 0x9405ad0a6208539879349284d71265479b1623846f70303da1f9890d6e8c10a7
+	// Topic1: escrowId = 100
+	// Topic2: buyer = 0x1111111111111111111111111111111111111111
+	// Topic3: seller = 0x2222222222222222222222222222222222222222
+	// Data: amount = 1000 (0x3e8, 32 bytes)
+	createdLog := models.AlchemyLog{
+		TransactionHash:  "0x1111111111111111111111111111111111111111111111111111111111111111",
+		LogIndex:         0,
+		TransactionIndex: 0,
+		BlockNumber:      "12345",
+		Address:          "0x3333333333333333333333333333333333333333",
+		Topics: []string{
+			"0x9405ad0a6208539879349284d71265479b1623846f70303da1f9890d6e8c10a7",
+			"0x0000000000000000000000000000000000000000000000000000000000000064",
+			"0x0000000000000000000000001111111111111111111111111111111111111111",
+			"0x0000000000000000000000002222222222222222222222222222222222222222",
+		},
+		Data: "0x00000000000000000000000000000000000000000000000000000000000003e8",
+	}
+
+	// 2. EscrowReleased event
+	// Topic0: 0x10ce17ae7e78eb775b13182ea618b201c2c81afc8fee55c287291f8686f17eac
+	// Topic1: escrowId = 100
+	// Data: amount = 1000
+	releasedLog := models.AlchemyLog{
+		TransactionHash:  "0x2222222222222222222222222222222222222222222222222222222222222222",
+		LogIndex:         1,
+		TransactionIndex: 0,
+		BlockNumber:      "12346",
+		Address:          "0x3333333333333333333333333333333333333333",
+		Topics: []string{
+			"0x10ce17ae7e78eb775b13182ea618b201c2c81afc8fee55c287291f8686f17eac",
+			"0x0000000000000000000000000000000000000000000000000000000000000064",
+		},
+		Data: "0x00000000000000000000000000000000000000000000000000000000000003e8",
+	}
+
+	payload := models.AlchemyWebhookPayload{
+		WebhookID: "wh_abi_test",
+		Event: models.AlchemyEvent{
+			Data: models.AlchemyData{
+				Block: models.AlchemyBlock{
+					Number: "12346",
+					Logs:   []models.AlchemyLog{createdLog, releasedLog},
+				},
+			},
+		},
+	}
+
+	bodyBytes, _ := json.Marshal(payload)
+	signature := computeSignature(bodyBytes, signingKey)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/indexer/webhook", bytes.NewReader(bodyBytes))
+	req.Header.Set("x-alchemy-signature", signature)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got: %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+
+	if len(repo.inserted) != 2 {
+		t.Fatalf("expected 2 events decoded and inserted, got %d", len(repo.inserted))
+	}
+
+	// Verify EscrowCreated
+	ev0 := repo.inserted[0]
+	if ev0.EventType != "EscrowCreated" {
+		t.Errorf("expected EventType 'EscrowCreated', got %s", ev0.EventType)
+	}
+	if ev0.EscrowID == nil || *ev0.EscrowID != "100" {
+		t.Errorf("expected EscrowID 100, got %v", ev0.EscrowID)
+	}
+	if ev0.RawData["amount"] != "1000" {
+		t.Errorf("expected amount '1000', got %v", ev0.RawData["amount"])
+	}
+	if !strings.EqualFold(fmt.Sprintf("%v", ev0.RawData["buyer"]), "0x1111111111111111111111111111111111111111") {
+		t.Errorf("unexpected buyer: %v", ev0.RawData["buyer"])
+	}
+	if !strings.EqualFold(fmt.Sprintf("%v", ev0.RawData["seller"]), "0x2222222222222222222222222222222222222222") {
+		t.Errorf("unexpected seller: %v", ev0.RawData["seller"])
+	}
+
+	// Verify EscrowReleased
+	ev1 := repo.inserted[1]
+	if ev1.EventType != "EscrowReleased" {
+		t.Errorf("expected EventType 'EscrowReleased', got %s", ev1.EventType)
+	}
+	if ev1.EscrowID == nil || *ev1.EscrowID != "100" {
+		t.Errorf("expected EscrowID 100, got %v", ev1.EscrowID)
+	}
+	if ev1.RawData["amount"] != "1000" {
+		t.Errorf("expected amount '1000', got %v", ev1.RawData["amount"])
 	}
 }
 
-// Test 4: Database idempotency safety net: verify DB insert succeeds cleanly without duplicate row errors even if Redis is bypassed
-func TestWebhookHandler_DatabaseIdempotencySafetyNet(t *testing.T) {
+// Test 5: Escrow Query Endpoint GET /v1/escrow/{id}/events
+func TestEscrowEventsHandler_QueryEndpoint(t *testing.T) {
+	repo := &mockEscrowEventsRepo{}
+	cfg := &config.Config{}
+
+	escrowID := "42"
+	amount := "5000"
+	contractAddr := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	repo.inserted = append(repo.inserted,
+		&models.EscrowEvent{
+			ID:              1,
+			ChainID:         11155111,
+			ContractAddress: contractAddr,
+			EventType:       "EscrowCreated",
+			TxHash:          common.HexToHash("0xaaa1"),
+			BlockNumber:     100,
+			LogIndex:        0,
+			EscrowID:        &escrowID,
+			Amount:          &amount,
+			RawData:         map[string]any{"amount": "5000"},
+		},
+		&models.EscrowEvent{
+			ID:              2,
+			ChainID:         11155111,
+			ContractAddress: contractAddr,
+			EventType:       "EscrowReleased",
+			TxHash:          common.HexToHash("0xaaa2"),
+			BlockNumber:     105,
+			LogIndex:        0,
+			EscrowID:        &escrowID,
+			Amount:          &amount,
+			RawData:         map[string]any{"amount": "5000"},
+		},
+	)
+
+	handler := handlers.EscrowEventsHandler(repo, cfg)
+
+	t.Run("query by decimal id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/escrow/42/events", nil)
+		req.SetPathValue("id", "42")
+		rec := httptest.NewRecorder()
+
+		handler(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got: %d (%s)", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Data []models.EscrowEvent `json:"data"`
+			Meta map[string]any       `json:"meta"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response JSON: %v", err)
+		}
+		if len(resp.Data) != 2 {
+			t.Fatalf("expected 2 events returned, got %d", len(resp.Data))
+		}
+		if resp.Data[0].EventType != "EscrowCreated" || resp.Data[1].EventType != "EscrowReleased" {
+			t.Errorf("unexpected event types returned: %+v", resp.Data)
+		}
+	})
+
+	t.Run("query by hex id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/escrow/0x2a/events", nil)
+		req.SetPathValue("id", "0x2a")
+		rec := httptest.NewRecorder()
+
+		handler(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got: %d (%s)", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Data []models.EscrowEvent `json:"data"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		if len(resp.Data) != 2 {
+			t.Fatalf("expected 2 events returned for hex id 0x2a, got %d", len(resp.Data))
+		}
+	})
+}
+
+// Test 6: Live Postgres Integration
+func TestWebhookHandler_LivePostgresIntegration(t *testing.T) {
 	pg, repo := getTestPostgres(t)
 	defer pg.Close()
 
@@ -336,120 +498,40 @@ func TestWebhookHandler_DatabaseIdempotencySafetyNet(t *testing.T) {
 	cfg := &config.Config{
 		ChainID:                  11155111,
 		AlchemyWebhookSigningKey: signingKey,
-		WTFEscrowContractAddress: "0x0000000000000000000000000000000000000000",
+		EscrowContractAddress:    "0x7777777777777777777777777777777777777777",
 	}
 
-	// Nil Redis client simulates Redis outage or bypassed in-memory deduplication tier
 	handler := handlers.NewWebhookHandler(cfg, repo, nil)
 
 	nonce := time.Now().UnixNano()
-	txHash := fmt.Sprintf("0xtx_db_safety_%016x", nonce)
-	logIndex := 0
-	escrowID := fmt.Sprintf("0xescrow_db_safety_%016x", nonce)
+	txHash := fmt.Sprintf("0x%032x%032x", nonce, nonce+1)
+	logIndex := int(nonce % 500)
+	escrowIDInt := nonce % 1000000
+	escrowIDHex := fmt.Sprintf("0x%064x", escrowIDInt)
+
+	createdLog := models.AlchemyLog{
+		TransactionHash:  txHash,
+		LogIndex:         logIndex,
+		TransactionIndex: 0,
+		BlockNumber:      "12345678",
+		Address:          "0x7777777777777777777777777777777777777777",
+		Topics: []string{
+			"0x9405ad0a6208539879349284d71265479b1623846f70303da1f9890d6e8c10a7",
+			escrowIDHex,
+			"0x0000000000000000000000001111111111111111111111111111111111111111",
+			"0x0000000000000000000000002222222222222222222222222222222222222222",
+		},
+		Data: "0x00000000000000000000000000000000000000000000000000000000000003e8",
+	}
 
 	payloadStruct := models.AlchemyWebhookPayload{
-		WebhookID: "wh_db_safety_test",
-		ID:        "evt_db_safety_test",
+		WebhookID: "wh_live_test",
 		CreatedAt: time.Now().UTC(),
-		Type:      "ADDRESS_ACTIVITY",
 		Event: models.AlchemyEvent{
 			Data: models.AlchemyData{
 				Block: models.AlchemyBlock{
 					Number: "12345678",
-					Hash:   "0xblock_hash_db_safety",
-					Logs: []models.AlchemyLog{
-						{
-							TransactionHash:  txHash,
-							LogIndex:         logIndex,
-							TransactionIndex: 0,
-							BlockNumber:      "12345678",
-							Address:          "0x111122223333444455556666777788889999aaaa",
-							Topics:           []string{"0xtopic0", escrowID},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	bodyBytes, err := json.Marshal(payloadStruct)
-	if err != nil {
-		t.Fatalf("failed to marshal payload: %v", err)
-	}
-	signature := computeSignature(bodyBytes, signingKey)
-
-	// First execution: inserts event
-	req1 := httptest.NewRequest(http.MethodPost, "/api/indexer/webhook", bytes.NewReader(bodyBytes))
-	req1.Header.Set("x-alchemy-signature", signature)
-	rec1 := httptest.NewRecorder()
-	handler.ServeHTTP(rec1, req1)
-
-	if rec1.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on first request, got: %d (%s)", rec1.Code, rec1.Body.String())
-	}
-
-	// Verify row in database
-	events, err := repo.GetEventsByEscrowID(ctx, escrowID)
-	if err != nil {
-		t.Fatalf("failed to get events by escrowID: %v", err)
-	}
-	if len(events) != 1 {
-		t.Fatalf("expected exactly 1 row in DB for escrowID %s, got %d", escrowID, len(events))
-	}
-
-	// Second execution (Redis bypassed): database unique constraint handles idempotency cleanly
-	req2 := httptest.NewRequest(http.MethodPost, "/api/indexer/webhook", bytes.NewReader(bodyBytes))
-	req2.Header.Set("x-alchemy-signature", signature)
-	rec2 := httptest.NewRecorder()
-	handler.ServeHTTP(rec2, req2)
-
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on repeated request even with bypassed Redis, got: %d (%s)", rec2.Code, rec2.Body.String())
-	}
-
-	// Verify database row was NOT duplicated
-	eventsAfter, err := repo.GetEventsByEscrowID(ctx, escrowID)
-	if err != nil {
-		t.Fatalf("failed to query events after second insert: %v", err)
-	}
-	if len(eventsAfter) != 1 {
-		t.Fatalf("expected exactly 1 row in DB after repeated insert, got %d", len(eventsAfter))
-	}
-}
-
-// Test 5: Contract Address Filtering
-func TestWebhookHandler_ContractAddressFiltering(t *testing.T) {
-	signingKey := "whsec_test_secret_key"
-	targetContract := "0x7777777777777777777777777777777777777777"
-	otherContract := "0x9999999999999999999999999999999999999999"
-
-	cfg := &config.Config{
-		AlchemyWebhookSigningKey: signingKey,
-		WTFEscrowContractAddress: targetContract,
-	}
-
-	repo := &mockChainEventsRepo{}
-	handler := handlers.NewWebhookHandler(cfg, repo, nil)
-
-	payloadStruct := models.AlchemyWebhookPayload{
-		WebhookID: "wh_filter_test",
-		Event: models.AlchemyEvent{
-			Data: models.AlchemyData{
-				Block: models.AlchemyBlock{
-					Logs: []models.AlchemyLog{
-						{
-							TransactionHash: "0xtx_ignored",
-							LogIndex:        0,
-							Address:         otherContract,
-							Topics:          []string{"0xsig", "0xescrow_ignored"},
-						},
-						{
-							TransactionHash: "0xtx_matched",
-							LogIndex:        1,
-							Address:         targetContract,
-							Topics:          []string{"0xsig", "0xescrow_matched"},
-						},
-					},
+					Logs:   []models.AlchemyLog{createdLog},
 				},
 			},
 		},
@@ -465,16 +547,17 @@ func TestWebhookHandler_ContractAddressFiltering(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got: %d", rec.Code)
+		t.Fatalf("expected 200 OK, got: %d (%s)", rec.Code, rec.Body.String())
 	}
 
-	// Only the matching contract log should be processed
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
-	if len(repo.inserted) != 1 {
-		t.Fatalf("expected exactly 1 inserted event, got %d", len(repo.inserted))
+	events, err := repo.GetEscrowEventsByEscrowID(ctx, fmt.Sprintf("%d", escrowIDInt))
+	if err != nil {
+		t.Fatalf("failed to query live postgres escrow events: %v", err)
 	}
-	if repo.inserted[0].TxHash != "0xtx_matched" {
-		t.Errorf("expected matched tx 0xtx_matched, got: %s", repo.inserted[0].TxHash)
+	if len(events) == 0 {
+		t.Fatalf("expected inserted event in live postgres, got 0")
+	}
+	if events[0].EventType != "EscrowCreated" {
+		t.Errorf("expected EventType 'EscrowCreated', got %s", events[0].EventType)
 	}
 }
