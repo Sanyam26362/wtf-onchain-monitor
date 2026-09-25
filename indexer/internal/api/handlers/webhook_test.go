@@ -561,3 +561,129 @@ func TestWebhookHandler_LivePostgresIntegration(t *testing.T) {
 		t.Errorf("expected EventType 'EscrowCreated', got %s", events[0].EventType)
 	}
 }
+
+func TestWebhookHandler_ReorgRemovedMapping(t *testing.T) {
+	signingKey := "whsec_test_reorg_key"
+	cfg := &config.Config{
+		ChainID:                  11155111,
+		AlchemyWebhookSigningKey: signingKey,
+		EscrowContractAddress:    "0x7777777777777777777777777777777777777777",
+	}
+
+	repo := &mockEscrowEventsRepo{}
+	handler := handlers.NewWebhookHandler(cfg, repo, nil)
+
+	reorgLog := models.AlchemyLog{
+		TransactionHash: "0xreorg1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+		LogIndex:        0,
+		BlockNumber:     "12345678",
+		Address:         "0x7777777777777777777777777777777777777777",
+		Removed:         true,
+		Topics: []string{
+			"0x9405ad0a6208539879349284d71265479b1623846f70303da1f9890d6e8c10a7",
+			"0x000000000000000000000000000000000000000000000000000000000000002a",
+			"0x0000000000000000000000001111111111111111111111111111111111111111",
+			"0x0000000000000000000000002222222222222222222222222222222222222222",
+		},
+		Data: "0x00000000000000000000000000000000000000000000000000000000000003e8",
+	}
+
+	payloadStruct := models.AlchemyWebhookPayload{
+		WebhookID: "wh_reorg_test",
+		CreatedAt: time.Now().UTC(),
+		Event: models.AlchemyEvent{
+			Data: models.AlchemyData{
+				Block: models.AlchemyBlock{
+					Number: "12345678",
+					Logs:   []models.AlchemyLog{reorgLog},
+				},
+			},
+		},
+	}
+
+	bodyBytes, _ := json.Marshal(payloadStruct)
+	signature := computeSignature(bodyBytes, signingKey)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/indexer/webhook", bytes.NewReader(bodyBytes))
+	req.Header.Set("x-alchemy-signature", signature)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got: %d", rec.Code)
+	}
+
+	if len(repo.inserted) != 1 {
+		t.Fatalf("expected 1 inserted event, got %d", len(repo.inserted))
+	}
+	if !repo.inserted[0].Removed {
+		t.Errorf("expected event.Removed to be true for reorg log, got false")
+	}
+}
+
+func TestWebhookHandler_RedisFailure_FailClosed(t *testing.T) {
+	signingKey := "whsec_test_failclosed_key"
+	cfg := &config.Config{
+		ChainID:                  11155111,
+		AlchemyWebhookSigningKey: signingKey,
+		EscrowContractAddress:    "0x7777777777777777777777777777777777777777",
+	}
+
+	// Create a redis client pointing to an unreachable port so SetNX errors out
+	badRedis := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:59999",
+		DialTimeout: 50 * time.Millisecond,
+		ReadTimeout: 50 * time.Millisecond,
+	})
+	defer badRedis.Close()
+
+	repo := &mockEscrowEventsRepo{}
+	handler := handlers.NewWebhookHandler(cfg, repo, badRedis)
+
+	testLog := models.AlchemyLog{
+		TransactionHash: "0xfailclosed1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		LogIndex:        0,
+		BlockNumber:     "12345678",
+		Address:         "0x7777777777777777777777777777777777777777",
+		Topics: []string{
+			"0x9405ad0a6208539879349284d71265479b1623846f70303da1f9890d6e8c10a7",
+			"0x000000000000000000000000000000000000000000000000000000000000002a",
+			"0x0000000000000000000000001111111111111111111111111111111111111111",
+			"0x0000000000000000000000002222222222222222222222222222222222222222",
+		},
+		Data: "0x00000000000000000000000000000000000000000000000000000000000003e8",
+	}
+
+	payloadStruct := models.AlchemyWebhookPayload{
+		WebhookID: "wh_failclosed_test",
+		CreatedAt: time.Now().UTC(),
+		Event: models.AlchemyEvent{
+			Data: models.AlchemyData{
+				Block: models.AlchemyBlock{
+					Number: "12345678",
+					Logs:   []models.AlchemyLog{testLog},
+				},
+			},
+		},
+	}
+
+	bodyBytes, _ := json.Marshal(payloadStruct)
+	signature := computeSignature(bodyBytes, signingKey)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/indexer/webhook", bytes.NewReader(bodyBytes))
+	req.Header.Set("x-alchemy-signature", signature)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK HTTP response, got: %d", rec.Code)
+	}
+
+	// Must have failed closed: 0 events saved in repository
+	if len(repo.inserted) != 0 {
+		t.Fatalf("expected 0 inserted events due to fail-closed on redis error, got %d", len(repo.inserted))
+	}
+}
+
