@@ -49,6 +49,11 @@ type LiveMonitorConfig struct {
 	TokenStreamID     string
 	TokenStartBlock   uint64
 	MaxBatchesPerPoll uint64
+
+	// Stream 3: WTFEscrow
+	EscrowContractAddress common.Address
+	EscrowStreamID        string
+	EscrowStartBlock      uint64
 }
 
 // LiveMonitor continuously monitors new safe blocks and indexes events into PostgreSQL.
@@ -57,6 +62,7 @@ type LiveMonitor struct {
 	client         blockchain.BlockchainClient
 	payrollService *Service
 	tokenIndexer   *TokenIndexer
+	escrowIndexer  *EscrowIndexer
 	persistence    PayrollPersistence
 }
 
@@ -67,6 +73,7 @@ func NewLiveMonitor(
 	payrollService *Service,
 	tokenIndexer *TokenIndexer,
 	db PayrollPersistence,
+	escrowIndexer ...*EscrowIndexer,
 ) (*LiveMonitor, error) {
 	if client == nil {
 		return nil, fmt.Errorf("blockchain client is nil")
@@ -86,12 +93,21 @@ func NewLiveMonitor(
 	if cfg.PayrollStreamID == "" {
 		cfg.PayrollStreamID = "monthly_payroll"
 	}
+	if cfg.EscrowStreamID == "" {
+		cfg.EscrowStreamID = "wtf_escrow"
+	}
+
+	var ei *EscrowIndexer
+	if len(escrowIndexer) > 0 {
+		ei = escrowIndexer[0]
+	}
 
 	return &LiveMonitor{
 		cfg:            cfg,
 		client:         client,
 		payrollService: payrollService,
 		tokenIndexer:   tokenIndexer,
+		escrowIndexer:  ei,
 		persistence:    db,
 	}, nil
 }
@@ -160,7 +176,65 @@ func (m *LiveMonitor) PollOnce(ctx context.Context) error {
 		}
 	}
 
+	// 3. Poll WTFEscrow stream
+	if m.escrowIndexer != nil && (m.cfg.EscrowContractAddress != common.Address{}) {
+		if _, err := m.PollEscrow(ctx, safeTarget); err != nil {
+			slog.Error("escrow live stream indexing error",
+				"stream", m.cfg.EscrowStreamID,
+				"error", err,
+			)
+		}
+	}
+
 	return nil
+}
+
+// PollEscrow checks and indexes new safe blocks for the WTFEscrow stream.
+func (m *LiveMonitor) PollEscrow(ctx context.Context, safeTarget uint64) (int, error) {
+	fromBlock, err := m.escrowIndexer.GetEffectiveStartBlock(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("resolve escrow start block: %w", err)
+	}
+
+	if fromBlock > safeTarget {
+		slog.Info("escrow stream up to date",
+			"stream", m.cfg.EscrowStreamID,
+			"checkpoint", fromBlock-1,
+			"safe_target", safeTarget,
+		)
+		return 0, nil
+	}
+
+	totalEvents := 0
+	batchesProcessed := uint64(0)
+	for from := fromBlock; from <= safeTarget && batchesProcessed < m.cfg.MaxBatchesPerPoll; {
+		if ctx.Err() != nil {
+			return totalEvents, ctx.Err()
+		}
+
+		to := from + m.cfg.BatchSize - 1
+		if to > safeTarget {
+			to = safeTarget
+		}
+
+		slog.Info("processing escrow block range",
+			"stream", m.cfg.EscrowStreamID,
+			"from_block", from,
+			"to_block", to,
+			"safe_target", safeTarget,
+		)
+
+		events, err := m.escrowIndexer.IndexRangeWithRetry(ctx, from, to)
+		if err != nil {
+			return totalEvents, fmt.Errorf("index escrow range [%d, %d]: %w", from, to, err)
+		}
+
+		totalEvents += len(events)
+		batchesProcessed++
+		from = to + 1
+	}
+
+	return totalEvents, nil
 }
 
 // PollPayroll checks and indexes new safe blocks for the MonthlyPayroll stream.
