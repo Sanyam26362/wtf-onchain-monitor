@@ -51,8 +51,10 @@ func (r *EscrowEventsRepository) SaveEscrowEvent(ctx context.Context, ev *models
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (chain_id, contract_address, tx_hash, log_index)
 		DO UPDATE SET
+			event_type      = EXCLUDED.event_type,
 			removed         = EXCLUDED.removed,
 			block_timestamp = EXCLUDED.block_timestamp,
+			escrow_id       = EXCLUDED.escrow_id,
 			amount          = EXCLUDED.amount,
 			raw_data        = EXCLUDED.raw_data
 		RETURNING id;
@@ -101,7 +103,7 @@ func (r *EscrowEventsRepository) GetEscrowEventsByEscrowID(ctx context.Context, 
 			raw_data,
 			created_at
 		FROM escrow_events
-		WHERE escrow_id = $1
+		WHERE escrow_id = CAST($1 AS NUMERIC)
 		ORDER BY block_number ASC, log_index ASC
 	`
 	rows, err := r.pool.Query(ctx, query, escrowID)
