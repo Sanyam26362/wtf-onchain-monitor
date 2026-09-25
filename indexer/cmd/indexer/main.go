@@ -11,10 +11,12 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 
 	indexerABI "worldtradefuture/indexer/internal/abi"
 	"worldtradefuture/indexer/internal/blockchain"
@@ -34,7 +36,7 @@ func main() {
 	liveFlag := flag.Bool("live", false, "Run in continuous live monitoring mode")
 	pollIntervalFlag := flag.Duration("poll-interval", 0, "Override live polling interval (e.g. 5s)")
 	confirmationsFlag := flag.Uint64("confirmations", 0, "Override confirmation depth")
-	streamFlag := flag.String("stream", "all", "Stream to process ('payroll', 'token', 'all', or 'reconcile')")
+	streamFlag := flag.String("stream", "all", "Stream to process ('payroll', 'token', 'escrow', 'all', or 'reconcile')")
 	maxRetriesFlag := flag.Int("max-retries", 0, "Override max RPC retries on transient/rate-limit error")
 	initialBackoffFlag := flag.Duration("initial-backoff", 0, "Override initial RPC retry backoff duration (e.g. 1s)")
 	reconcileFlag := flag.Bool("reconcile", false, "Run reconciliation check")
@@ -111,6 +113,15 @@ func main() {
 		fmt.Printf("Token Start Block:       %d\n", cfg.TokenStartBlock)
 		fmt.Printf("Token Stream ID:         %s\n", cfg.TokenStreamID)
 	}
+	escrowContract := cfg.EscrowContractAddress
+	if escrowContract == "" {
+		escrowContract = cfg.WTFEscrowContractAddress
+	}
+	if escrowContract != "" && !isZeroAddress(escrowContract) {
+		fmt.Printf("Escrow Contract:         %s\n", escrowContract)
+		fmt.Printf("Escrow Start Block:      %d\n", cfg.EscrowStartBlock)
+		fmt.Printf("Escrow Stream ID:        %s\n", cfg.EscrowStreamID)
+	}
 	fmt.Println("--------------------------------------------------")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -127,6 +138,20 @@ func main() {
 		log.Fatalf("failed to connect to database: %v", err)
 	}
 	defer db.Close()
+
+	var rdb *redis.Client
+	if cfg.RedisURL != "" {
+		redisCtx, redisCancel := context.WithTimeout(ctx, 5*time.Second)
+		var redisErr error
+		rdb, redisErr = persistence.NewRedisClient(redisCtx, cfg.RedisURL, "", 0)
+		redisCancel()
+		if redisErr != nil {
+			slog.Warn("redis connection not established, running without redis pubsub", "error", redisErr.Error())
+		} else {
+			defer rdb.Close()
+			slog.Info("connected to redis", "url", cfg.RedisURL)
+		}
+	}
 
 	// 1. Run database migrations if migrations directory exists
 	migrationsDir := "./migrations"
@@ -203,6 +228,33 @@ func main() {
 		})
 	}
 
+	// Initialize WTFEscrow indexer if configured
+	var escrowIndexer *indexer.EscrowIndexer
+	if escrowContract != "" && common.IsHexAddress(escrowContract) && !isZeroAddress(escrowContract) && (*streamFlag == "all" || *streamFlag == "escrow") {
+		escrowAddr := common.HexToAddress(escrowContract)
+		var err error
+		escrowIndexer, err = indexer.NewEscrowIndexer(
+			client,
+			db,
+			rdb,
+			escrowAddr,
+			cfg.ChainID,
+			cfg.EscrowStreamID,
+			cfg.EscrowStartBlock,
+			batchSize,
+		)
+		if err != nil {
+			log.Fatalf("failed to create WTFEscrow indexer: %v", err)
+		}
+		escrowIndexer.SetRetryPolicy(indexer.RetryPolicy{
+			MaxRetries:     cfg.RPCMaxRetries,
+			InitialBackoff: cfg.RPCInitialBackoff,
+			MaxBackoff:     cfg.RPCMaxBackoff,
+			BackoffFactor:  cfg.RPCBackoffFactor,
+			Sleeper:        indexer.DefaultSleeper,
+		})
+	}
+
 	// Branch: Continuous Live Monitoring vs Historical Backfill
 	if isLiveMode {
 		fmt.Println("\n==================================================")
@@ -220,9 +272,12 @@ func main() {
 			TokenAddress:           common.HexToAddress(cfg.TokenAddress),
 			TokenStreamID:          cfg.TokenStreamID,
 			TokenStartBlock:        cfg.TokenStartBlock,
+			EscrowContractAddress:  common.HexToAddress(escrowContract),
+			EscrowStreamID:         cfg.EscrowStreamID,
+			EscrowStartBlock:       cfg.EscrowStartBlock,
 		}
 
-		liveMonitor, err := indexer.NewLiveMonitor(liveCfg, client, payrollService, tokenIndexer, db)
+		liveMonitor, err := indexer.NewLiveMonitor(liveCfg, client, payrollService, tokenIndexer, db, escrowIndexer)
 		if err != nil {
 			log.Fatalf("failed to initialize live monitor: %v", err)
 		}
@@ -550,9 +605,35 @@ func main() {
 			cfg.TokenStreamID, totalTransfers, lastIndexedToken)
 	}
 
+	// 4. Index WTFEscrow events if configured
+	if escrowIndexer != nil {
+		escrowTargetBlock := targetBlock
+		if targetBlock < cfg.EscrowStartBlock {
+			var safeBlock uint64 = latestBlock
+			if cfg.ConfirmationDepth > 0 && latestBlock >= cfg.ConfirmationDepth {
+				safeBlock = latestBlock - cfg.ConfirmationDepth
+			}
+			escrowTargetBlock = safeBlock
+		}
+
+		fmt.Printf("\n[Stream: %s] Processing WTFEscrow: %s (target block: %d)\n", cfg.EscrowStreamID, escrowContract, escrowTargetBlock)
+		lastIndexedEscrow, totalEscrowEvents, err := escrowIndexer.RunBackfill(ctx, escrowTargetBlock)
+		if err != nil {
+			log.Fatalf("escrow indexing error: %v", err)
+		}
+
+		fmt.Printf("[Stream: %s] Successfully indexed %d WTFEscrow event(s) up to block %d\n",
+			cfg.EscrowStreamID, totalEscrowEvents, lastIndexedEscrow)
+	}
+
 	fmt.Println("==================================================")
 	fmt.Println("WTF Indexer run complete.")
 	fmt.Println("==================================================")
+}
+
+func isZeroAddress(addr string) bool {
+	a := strings.TrimPrefix(strings.ToLower(addr), "0x")
+	return a == "" || strings.Trim(a, "0") == ""
 }
 
 func printReconciliationSummary(title string, res *reconciliation.ReconciliationResult) {
