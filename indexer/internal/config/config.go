@@ -150,6 +150,9 @@ func Load() (Config, error) {
 		env = os.Getenv("APP_ENV")
 	}
 	if env == "" {
+		env = os.Getenv("ENVIRONMENT")
+	}
+	if env == "" {
 		return Config{}, fmt.Errorf("missing required environment variable: DEPLOYMENT_ENVIRONMENT or APP_ENV")
 	}
 
@@ -311,7 +314,11 @@ func Load() (Config, error) {
 	}
 
 	alchemyWebhookSigningKey := os.Getenv("ALCHEMY_WEBHOOK_SIGNING_KEY")
-	if alchemyWebhookSigningKey == "" {
+	if !strings.EqualFold(env, "development") {
+		if alchemyWebhookSigningKey == "" || alchemyWebhookSigningKey == "whsec_test_dummy_key" {
+			return Config{}, fmt.Errorf("ALCHEMY_WEBHOOK_SIGNING_KEY is required in non-development environments")
+		}
+	} else if alchemyWebhookSigningKey == "" {
 		alchemyWebhookSigningKey = "whsec_test_dummy_key"
 	}
 
