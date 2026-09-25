@@ -125,8 +125,10 @@ func (h *WebhookHandler) HandleAlchemyWebhook(w http.ResponseWriter, r *http.Req
 			dedupeKey := fmt.Sprintf("wtf:chain:evt:%s:%d", log.TransactionHash, log.LogIndex)
 			ok, err := h.redisClient.SetNX(ctx, dedupeKey, "1", 30*24*time.Hour).Result()
 			if err != nil {
-				slog.Warn("failed to check redis deduplication", "key", dedupeKey, "error", err)
-			} else if !ok {
+				slog.Warn("failed to check redis deduplication; dropping event to prevent unverified processing", "key", dedupeKey, "err", err)
+				continue // Must fail closed
+			}
+			if !ok {
 				slog.Info("chain event already processed, skipping duplicate", "key", dedupeKey, "txHash", log.TransactionHash, "logIndex", log.LogIndex)
 				continue
 			}
@@ -169,7 +171,7 @@ func (h *WebhookHandler) HandleAlchemyWebhook(w http.ResponseWriter, r *http.Req
 			BlockNumber:     uint64(blockNum),
 			BlockTimestamp:  blockTime,
 			LogIndex:        uint(log.LogIndex),
-			Removed:         false,
+			Removed:         log.Removed,
 			EscrowID:        escrowID,
 			Amount:          amount,
 			RawData:         rawData,
