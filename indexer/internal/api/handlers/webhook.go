@@ -6,38 +6,47 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	gethabi "github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/redis/go-redis/v9"
 
+	indexerABI "worldtradefuture/indexer/internal/abi"
 	"worldtradefuture/indexer/internal/api/middleware"
 	"worldtradefuture/indexer/internal/config"
 	"worldtradefuture/indexer/internal/models"
 )
 
-// ChainEventsRepository defines the storage interface required by WebhookHandler.
-type ChainEventsRepository interface {
-	InsertChainEvent(ctx context.Context, event *models.ChainEvent) error
-	GetEventsByEscrowID(ctx context.Context, escrowID string) ([]models.ChainEvent, error)
-	GetEventByTxAndLogIndex(ctx context.Context, txHash string, logIndex int) (*models.ChainEvent, error)
+// EscrowEventsRepository defines the storage interface required by WebhookHandler.
+type EscrowEventsRepository interface {
+	SaveEscrowEvent(ctx context.Context, event *models.EscrowEvent) error
 }
 
-// WebhookHandler processes incoming Alchemy Notify webhooks with Redis deduplication and Pub/Sub broadcast.
+// WebhookHandler processes incoming Alchemy Notify webhooks with real ABI decoding,
+// Redis deduplication, and Pub/Sub broadcast.
 type WebhookHandler struct {
 	cfg         *config.Config
-	eventsRepo  ChainEventsRepository
+	eventsRepo  EscrowEventsRepository
 	redisClient *redis.Client
+	abi         gethabi.ABI
 }
 
 // NewWebhookHandler creates a new WebhookHandler instance.
-func NewWebhookHandler(cfg *config.Config, eventsRepo ChainEventsRepository, redisClient *redis.Client) *WebhookHandler {
+func NewWebhookHandler(cfg *config.Config, eventsRepo EscrowEventsRepository, redisClient *redis.Client) *WebhookHandler {
+	parsedABI, err := gethabi.JSON(strings.NewReader(indexerABI.WTFEscrowABI))
+	if err != nil {
+		slog.Error("failed to parse WTFEscrow ABI for webhook handler", "error", err)
+	}
 	return &WebhookHandler{
 		cfg:         cfg,
 		eventsRepo:  eventsRepo,
 		redisClient: redisClient,
+		abi:         parsedABI,
 	}
 }
 
@@ -46,7 +55,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.HandleAlchemyWebhook(w, r)
 }
 
-// HandleAlchemyWebhook ingests and processes Alchemy Notify webhook requests.
+// HandleAlchemyWebhook ingests, validates, decodes, and persists Alchemy Notify webhook requests.
 func (h *WebhookHandler) HandleAlchemyWebhook(w http.ResponseWriter, r *http.Request) {
 	// 1. Read raw body
 	rawBody, err := io.ReadAll(r.Body)
@@ -89,7 +98,11 @@ func (h *WebhookHandler) HandleAlchemyWebhook(w http.ResponseWriter, r *http.Req
 	// 5. Iterate through payload.Event.Data.Block.Logs
 	expectedContract := ""
 	if h.cfg != nil {
-		expectedContract = strings.TrimSpace(h.cfg.WTFEscrowContractAddress)
+		if h.cfg.EscrowContractAddress != "" {
+			expectedContract = strings.TrimSpace(h.cfg.EscrowContractAddress)
+		} else {
+			expectedContract = strings.TrimSpace(h.cfg.WTFEscrowContractAddress)
+		}
 	}
 
 	ctx := r.Context()
@@ -126,12 +139,6 @@ func (h *WebhookHandler) HandleAlchemyWebhook(w http.ResponseWriter, r *http.Req
 		}
 		blockNum := parseBlockNumber(blockNumStr)
 
-		// Parse escrow_id: if len(topics) > 1, escrow_id = topics[1]
-		escrowID := ""
-		if len(log.Topics) > 1 {
-			escrowID = log.Topics[1]
-		}
-
 		// ChainID: 11155111 (Sepolia) or from config
 		chainID := int64(11155111)
 		if h.cfg != nil && h.cfg.ChainID > 0 {
@@ -140,53 +147,62 @@ func (h *WebhookHandler) HandleAlchemyWebhook(w http.ResponseWriter, r *http.Req
 
 		contractAddr := logAddr
 		if contractAddr == "" && h.cfg != nil {
-			contractAddr = h.cfg.WTFEscrowContractAddress
+			contractAddr = h.cfg.EscrowContractAddress
+			if contractAddr == "" {
+				contractAddr = h.cfg.WTFEscrowContractAddress
+			}
 		}
 
-		blockTimestamp := payload.CreatedAt.Unix()
-		if blockTimestamp <= 0 {
-			blockTimestamp = time.Now().Unix()
+		blockTime := payload.CreatedAt.UTC()
+		if blockTime.IsZero() {
+			blockTime = time.Now().UTC()
 		}
 
-		event := models.ChainEvent{
-			ChainID:          chainID,
-			ContractAddress:  contractAddr,
-			EventName:        "EscrowSettled",
-			TxHash:           log.TransactionHash,
-			BlockNumber:      blockNum,
-			BlockHash:        payload.Event.Data.Block.Hash,
-			LogIndex:         log.LogIndex,
-			TxIndex:          log.TransactionIndex,
-			BlockTimestamp:   blockTimestamp,
-			EscrowID:         escrowID,
-			Buyer:            "0x",
-			Seller:           "0x",
-			Amount:           "0",
-			AlchemyWebhookID: payload.WebhookID,
-			RawPayload:       string(rawBody),
-			IndexedAt:        time.Now().UTC(),
+		// Decode Log with canonical WTFEscrow ABI signatures
+		eventName, escrowID, amount, rawData := h.decodeAlchemyLog(log)
+
+		escrowEvent := models.EscrowEvent{
+			ChainID:         chainID,
+			ContractAddress: common.HexToAddress(contractAddr),
+			EventType:       eventName,
+			TxHash:          common.HexToHash(log.TransactionHash),
+			BlockNumber:     uint64(blockNum),
+			BlockTimestamp:  blockTime,
+			LogIndex:        uint(log.LogIndex),
+			Removed:         false,
+			EscrowID:        escrowID,
+			Amount:          amount,
+			RawData:         rawData,
+			CreatedAt:       time.Now().UTC(),
 		}
 
 		// Store in DB: idempotent insert
 		if h.eventsRepo != nil {
-			if err := h.eventsRepo.InsertChainEvent(ctx, &event); err != nil {
-				slog.Error("failed to insert chain event into database", "txHash", log.TransactionHash, "logIndex", log.LogIndex, "error", err)
+			if err := h.eventsRepo.SaveEscrowEvent(ctx, &escrowEvent); err != nil {
+				slog.Error("failed to insert escrow event into database", "txHash", log.TransactionHash, "logIndex", log.LogIndex, "error", err)
 			}
 		}
 
-		// Redis Pub/Sub: publish to wtf:chain:settled
+		// Redis Pub/Sub: broadcast event notification payload to wtf:chain:events and wtf:chain:settled
 		if h.redisClient != nil {
-			msg := models.ChainSettledMessage{
-				EscrowID: escrowID,
-				TxHash:   log.TransactionHash,
+			escrowIDStr := ""
+			if escrowID != nil {
+				escrowIDStr = *escrowID
 			}
-			msgBytes, err := json.Marshal(msg)
-			if err != nil {
-				slog.Error("failed to marshal chain settled message", "error", err)
-			} else {
-				if err := h.redisClient.Publish(ctx, "wtf:chain:settled", msgBytes).Err(); err != nil {
-					slog.Error("failed to publish chain settled message to redis", "channel", "wtf:chain:settled", "error", err)
-				}
+			amountStr := ""
+			if amount != nil {
+				amountStr = *amount
+			}
+
+			payload := map[string]any{
+				"escrowId":  escrowIDStr,
+				"txHash":    log.TransactionHash,
+				"eventType": eventName,
+				"amount":    amountStr,
+			}
+			if msgBytes, err := json.Marshal(payload); err == nil {
+				_ = h.redisClient.Publish(ctx, "wtf:chain:events", msgBytes).Err()
+				_ = h.redisClient.Publish(ctx, "wtf:chain:settled", msgBytes).Err()
 			}
 		}
 	}
@@ -195,6 +211,128 @@ func (h *WebhookHandler) HandleAlchemyWebhook(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"ok": true}`))
+}
+
+// decodeAlchemyLog attempts to decode the event using the parsed canonical ABI.
+func (h *WebhookHandler) decodeAlchemyLog(log models.AlchemyLog) (string, *string, *string, map[string]any) {
+	rawData := make(map[string]any)
+	var escrowID *string
+	var amount *string
+
+	if len(log.Topics) == 0 {
+		return "Unknown", nil, nil, rawData
+	}
+
+	// Extract escrowId from Topics[1] as *big.Int and store as string
+	if len(log.Topics) > 1 {
+		escrowHex := log.Topics[1]
+		if bi := parseBigIntHex(escrowHex); bi != nil {
+			s := bi.String()
+			escrowID = &s
+			rawData["escrowId"] = s
+		}
+	}
+
+	topic0 := common.HexToHash(log.Topics[0])
+
+	switch topic0 {
+	case indexerABI.TopicEscrowCreated:
+		// buyer (Topics[2]), seller (Topics[3]), amount from log.Data[0:32]
+		if len(log.Topics) > 2 {
+			buyer := common.HexToAddress(log.Topics[2])
+			rawData["buyer"] = buyer.Hex()
+		}
+		if len(log.Topics) > 3 {
+			seller := common.HexToAddress(log.Topics[3])
+			rawData["seller"] = seller.Hex()
+		}
+		if log.Data != "" && log.Data != "0x" {
+			dataBytes := common.FromHex(log.Data)
+			if len(dataBytes) >= 32 {
+				amt := new(big.Int).SetBytes(dataBytes[0:32])
+				s := amt.String()
+				amount = &s
+				rawData["amount"] = s
+			}
+		}
+		return "EscrowCreated", escrowID, amount, rawData
+
+	case indexerABI.TopicEscrowReleased:
+		// amount from log.Data[0:32]
+		if log.Data != "" && log.Data != "0x" {
+			dataBytes := common.FromHex(log.Data)
+			if len(dataBytes) >= 32 {
+				amt := new(big.Int).SetBytes(dataBytes[0:32])
+				s := amt.String()
+				amount = &s
+				rawData["amount"] = s
+			}
+		}
+		return "EscrowReleased", escrowID, amount, rawData
+
+	case indexerABI.TopicEscrowRefunded:
+		// amount from log.Data[0:32]
+		if log.Data != "" && log.Data != "0x" {
+			dataBytes := common.FromHex(log.Data)
+			if len(dataBytes) >= 32 {
+				amt := new(big.Int).SetBytes(dataBytes[0:32])
+				s := amt.String()
+				amount = &s
+				rawData["amount"] = s
+			}
+		}
+		return "EscrowRefunded", escrowID, amount, rawData
+
+	case indexerABI.TopicDisputeResolved:
+		// winner (Topics[2]), amountReleased from log.Data[0:32]
+		if len(log.Topics) > 2 {
+			winner := common.HexToAddress(log.Topics[2])
+			rawData["winner"] = winner.Hex()
+		}
+		if log.Data != "" && log.Data != "0x" {
+			dataBytes := common.FromHex(log.Data)
+			if len(dataBytes) >= 32 {
+				amt := new(big.Int).SetBytes(dataBytes[0:32])
+				s := amt.String()
+				amount = &s
+				rawData["amountReleased"] = s
+				rawData["amount"] = s
+			}
+		}
+		return "DisputeResolved", escrowID, amount, rawData
+
+	case indexerABI.TopicDeliveryAcknowledged:
+		if log.Data != "" && log.Data != "0x" {
+			dataBytes := common.FromHex(log.Data)
+			if len(dataBytes) >= 32 {
+				dt := new(big.Int).SetBytes(dataBytes[0:32])
+				s := dt.String()
+				rawData["deliveryTime"] = s
+			}
+		}
+		return "DeliveryAcknowledged", escrowID, nil, rawData
+
+	case indexerABI.TopicDisputeRaised:
+		if len(log.Topics) > 2 {
+			raisedBy := common.HexToAddress(log.Topics[2])
+			rawData["raisedBy"] = raisedBy.Hex()
+		}
+		if log.Data != "" && log.Data != "0x" {
+			dataBytes := common.FromHex(log.Data)
+			if len(dataBytes) >= 32 {
+				fee := new(big.Int).SetBytes(dataBytes[0:32])
+				s := fee.String()
+				rawData["disputeFee"] = s
+			}
+		}
+		return "DisputeRaised", escrowID, nil, rawData
+
+	default:
+		if eventDef, err := h.abi.EventByID(topic0); err == nil {
+			return eventDef.Name, escrowID, nil, rawData
+		}
+		return "Unknown", escrowID, nil, rawData
+	}
 }
 
 func parseBlockNumber(s string) int64 {
@@ -213,6 +351,17 @@ func parseBlockNumber(s string) int64 {
 		return num
 	}
 	return 0
+}
+
+func parseBigIntHex(s string) *big.Int {
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	bi := new(big.Int)
+	bi, ok := bi.SetString(s, 16)
+	if !ok {
+		return nil
+	}
+	return bi
 }
 
 func isZeroAddress(addr string) bool {
