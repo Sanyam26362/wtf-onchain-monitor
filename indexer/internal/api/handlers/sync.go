@@ -89,13 +89,12 @@ func SyncBackfillHandler(cfg *config.Config) http.HandlerFunc {
 			streamID = "all_streams"
 		}
 
-		responses.WriteSuccess(w, http.StatusAccepted, map[string]any{
-			"status":     "accepted",
-			"stream_id":  streamID,
-			"from_block": req.FromBlock,
-			"to_block":   req.ToBlock,
-			"chain_id":   cfg.ChainID,
-			"message":    fmt.Sprintf("Backfill scheduled for blocks %d to %d", req.FromBlock, req.ToBlock),
-		}, nil)
+		_ = streamID
+		responses.WriteError(
+			w,
+			http.StatusNotImplemented,
+			responses.ErrCodeNotImplemented,
+			"asynchronous backfill queue is not yet implemented; RPC backfill must be triggered via cmd/indexer --stream=escrow --from-block=X --to-block=Y",
+		)
 	}
 }
