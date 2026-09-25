@@ -31,9 +31,11 @@ func NewRouter(pool *pgxpool.Pool, cfg *config.Config, logger *slog.Logger, redi
 	syncRepo := repository.NewSyncRepository(pool)
 	recRepo := repository.NewReconciliationRepository(pool)
 	chainEventsRepo := repository.NewChainEventsRepository(pool)
+	escrowEventsRepo := repository.NewEscrowEventsRepository(pool)
+	_ = chainEventsRepo
 
 	// Webhook handler (Alchemy Notify)
-	webhookHandler := handlers.NewWebhookHandler(cfg, chainEventsRepo, rdb)
+	webhookHandler := handlers.NewWebhookHandler(cfg, escrowEventsRepo, rdb)
 	mux.HandleFunc("POST /api/indexer/webhook", webhookHandler.HandleAlchemyWebhook)
 
 	// System & Health endpoints
@@ -52,6 +54,8 @@ func NewRouter(pool *pgxpool.Pool, cfg *config.Config, logger *slog.Logger, redi
 	mux.HandleFunc("GET /v1/payroll/claims", handlers.PayrollClaimsHandler(payrollRepo, cfg))
 	mux.HandleFunc("GET /v1/tokens/{address}/transfers", handlers.TokenTransfersHandler(tokensRepo, cfg))
 	mux.HandleFunc("GET /v1/reconciliation/exceptions", handlers.ReconciliationExceptionsHandler(recRepo, cfg))
+	mux.HandleFunc("GET /v1/escrow/{id}/events", handlers.EscrowEventsHandler(escrowEventsRepo, cfg))
+	mux.HandleFunc("GET /api/chain/events/{id}", handlers.EscrowEventsHandler(escrowEventsRepo, cfg))
 
 	// Global middleware chain: RequestID -> CORS -> Logger -> Recoverer -> ServeMux
 	var handler http.Handler = mux
