@@ -418,4 +418,17 @@ func (m *LiveMonitor) logInitialStatus(ctx context.Context) {
 			"safe_target", safeTarget,
 		)
 	}
+
+	if m.escrowIndexer != nil && (m.cfg.EscrowContractAddress != common.Address{}) {
+		cp, found, _ := m.persistence.GetCheckpoint(ctx, m.cfg.ChainID, m.cfg.EscrowStreamID)
+		cpStr := "none"
+		if found {
+			cpStr = fmt.Sprintf("%d", cp)
+		}
+		slog.Info("ESCROW stream status",
+			"stream", m.cfg.EscrowStreamID,
+			"checkpoint", cpStr,
+			"safe_target", safeTarget,
+		)
+	}
 }
