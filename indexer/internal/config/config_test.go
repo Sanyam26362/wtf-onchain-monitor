@@ -311,8 +311,11 @@ func TestLoad_RedisAndEscrowConfig(t *testing.T) {
 	if cfg.AlchemyWebhookSigningKey != "whsec_test_dummy_key" {
 		t.Errorf("expected default AlchemyWebhookSigningKey 'whsec_test_dummy_key', got %q", cfg.AlchemyWebhookSigningKey)
 	}
-	if cfg.WTFEscrowContractAddress != "0x0000000000000000000000000000000000000000" {
-		t.Errorf("expected default WTFEscrowContractAddress '0x0000000000000000000000000000000000000000', got %q", cfg.WTFEscrowContractAddress)
+	if cfg.WTFEscrowContractAddress != "" {
+		t.Errorf("expected default WTFEscrowContractAddress '', got %q", cfg.WTFEscrowContractAddress)
+	}
+	if cfg.EscrowContractAddress != "" {
+		t.Errorf("expected default EscrowContractAddress '', got %q", cfg.EscrowContractAddress)
 	}
 
 	// Test custom values
@@ -334,5 +337,117 @@ func TestLoad_RedisAndEscrowConfig(t *testing.T) {
 	if cfgCustom.WTFEscrowContractAddress != "0x1111111111111111111111111111111111111111" {
 		t.Errorf("expected custom WTFEscrowContractAddress '0x1111111111111111111111111111111111111111', got %q", cfgCustom.WTFEscrowContractAddress)
 	}
+	if cfgCustom.EscrowContractAddress != "0x1111111111111111111111111111111111111111" {
+		t.Errorf("expected custom EscrowContractAddress '0x1111111111111111111111111111111111111111', got %q", cfgCustom.EscrowContractAddress)
+	}
+
+	// Test ESCROW_CONTRACT_ADDRESS overrides WTF_ESCROW_CONTRACT_ADDRESS
+	t.Setenv("ESCROW_CONTRACT_ADDRESS", "0x2222222222222222222222222222222222222222")
+	t.Setenv("ESCROW_START_BLOCK", "123456")
+	t.Setenv("ESCROW_STREAM_ID", "custom_escrow_stream")
+	cfgEscrow, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading escrow config: %v", err)
+	}
+	if cfgEscrow.EscrowContractAddress != "0x2222222222222222222222222222222222222222" {
+		t.Errorf("expected EscrowContractAddress '0x2222222222222222222222222222222222222222', got %q", cfgEscrow.EscrowContractAddress)
+	}
+	if cfgEscrow.WTFEscrowContractAddress != "0x2222222222222222222222222222222222222222" {
+		t.Errorf("expected WTFEscrowContractAddress '0x2222222222222222222222222222222222222222', got %q", cfgEscrow.WTFEscrowContractAddress)
+	}
+	if cfgEscrow.EscrowStartBlock != 123456 {
+		t.Errorf("expected EscrowStartBlock 123456, got %d", cfgEscrow.EscrowStartBlock)
+	}
+	if cfgEscrow.EscrowStreamID != "custom_escrow_stream" {
+		t.Errorf("expected EscrowStreamID 'custom_escrow_stream', got %q", cfgEscrow.EscrowStreamID)
+	}
 }
+
+func TestPayrollStreamID_AddressScoped(t *testing.T) {
+	newContract := "0x63Ea5C8C90f0F09349CBDDD2c0d5f46E9C18B1EF"
+	expected := "monthly_payroll_0x63ea5c8c90f0f09349cbddd2c0d5f46e9c18b1ef"
+
+	got := PayrollStreamID(newContract)
+	if got != expected {
+		t.Fatalf("PayrollStreamID(%s) = %q, want %q", newContract, got, expected)
+	}
+
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11753288")
+	t.Setenv("CONFIRMATIONS", "5")
+	t.Setenv("POLLING_INTERVAL", "5s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("PAYROLL_CONTRACT_ADDRESS", newContract)
+	t.Setenv("PAYROLL_STREAM_ID", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.PayrollStreamID != expected {
+		t.Fatalf("cfg.PayrollStreamID = %q, want %q", cfg.PayrollStreamID, expected)
+	}
+
+	t.Setenv("PAYROLL_STREAM_ID", "monthly_payroll")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.PayrollStreamID != expected {
+		t.Fatalf("cfg.PayrollStreamID = %q, want %q when PAYROLL_STREAM_ID=monthly_payroll", cfg.PayrollStreamID, expected)
+	}
+}
+
+func TestPayrollStreamID_DifferentAddressesProduceDifferentStreamIDs(t *testing.T) {
+	oldContract := "0x430e558d403E3668C3A2E3435ff2Fd6a01Eb7F3A"
+	newContract := "0x63Ea5C8C90f0F09349CBDDD2c0d5f46E9C18B1EF"
+
+	oldStream := PayrollStreamID(oldContract)
+	newStream := PayrollStreamID(newContract)
+
+	if oldStream == newStream {
+		t.Fatalf("expected different stream IDs, both were %q", oldStream)
+	}
+	if oldStream != "monthly_payroll_0x430e558d403e3668c3a2e3435ff2fd6a01eb7f3a" {
+		t.Fatalf("unexpected oldStream: %q", oldStream)
+	}
+	if newStream != "monthly_payroll_0x63ea5c8c90f0f09349cbddd2c0d5f46e9c18b1ef" {
+		t.Fatalf("unexpected newStream: %q", newStream)
+	}
+}
+
+func TestTokenStreamID_Unchanged(t *testing.T) {
+	tokenAddr := "0x378AFb93CaDd39AFF154704d2D90Af8c401137E7"
+	expectedTokenStream := "erc20_transfers_0x378afb93cadd39aff154704d2d90af8c401137e7"
+
+	t.Setenv("CHAIN_ID", "11155111")
+	t.Setenv("START_BLOCK", "11080692")
+	t.Setenv("CONFIRMATIONS", "5")
+	t.Setenv("POLLING_INTERVAL", "5s")
+	t.Setenv("RPC_URL", "https://sepolia.example.com")
+	t.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
+	t.Setenv("DEPLOYMENT_ENVIRONMENT", "test")
+	t.Setenv("TOKEN_ADDRESS", tokenAddr)
+	t.Setenv("TOKEN_STREAM_ID", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.TokenStreamID != expectedTokenStream {
+		t.Fatalf("cfg.TokenStreamID = %q, want %q", cfg.TokenStreamID, expectedTokenStream)
+	}
+
+	t.Setenv("TOKEN_STREAM_ID", "custom_token_stream")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.TokenStreamID != "custom_token_stream" {
+		t.Fatalf("cfg.TokenStreamID = %q, want custom_token_stream", cfg.TokenStreamID)
+	}
+}
+
 
